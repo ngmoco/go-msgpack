@@ -47,7 +47,7 @@ import (
 )
 
 var (
-	raisePanicAfterRecover = true
+	raisePanicAfterRecover = false
 	structInfoFieldName = "_struct"
 	
 	cachedStructFieldInfos = make(map[reflect.Type][]*structFieldInfo, 4)
