@@ -2,6 +2,9 @@ MsgPack library for Go.
 
 http://wiki.msgpack.org/display/MSGPACK/Format+specification
 
+To install:
+  go get github.com/ugorji/go-msgpack/msgpack
+
 It provides features similar to encoding packages in the standard library (ie json, xml, gob, etc).
 
 Supports:
