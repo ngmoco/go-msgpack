@@ -1,0 +1,32 @@
+MsgPack library for Go.
+
+http://wiki.msgpack.org/display/MSGPACK/Format+specification
+
+It provides features similar to encoding packages in the standard library (ie json, xml, gob, etc).
+
+Supports:
+  - Standard Marshal/Unmarshal interface.
+  - Standard field renaming via tags
+  - Encoding from any value (struct, slice, map, primitives, pointers, interface{}, etc)
+  - Decoding into a pointer to any non-nil value (struct, slice, map, int, float32, bool, string, etc)
+  - Decoding into a nil interface{} (big)
+  - Handles time.Time transparently (using RFC3339 format).
+
+Usage
+
+  dec = msgpack.NewDecoder(r)
+  err = dec.Decode(&v) 
+  
+  enc = msgpack.NewEncoder(w)
+  err = enc.Encode(v) 
+  
+  //methods below are convenience methods over functions above.
+  data, err = msgpack.Marshal(v) 
+  err = msgpack.Unmarshal(data, &v)
+
+JSON Compatibility
+
+The Decoder decodes nil interface{} to be JSON compatible by default.
+You can tweak the OptionsMask to get whatever behaviour you want. 
+See NewDecoder(...) documentation.
+
