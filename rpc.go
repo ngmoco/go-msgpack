@@ -70,8 +70,8 @@ func NewRPCCodec(conn io.ReadWriteCloser) *rpcCodec {
 	//this is because multiple requests can use one connection.
 	return &rpcCodec{
 		rwc: conn,
-		dec: NewDecoder(conn),
-		enc: NewEncoder(conn),
+		dec: NewDecoder(conn, nil),
+		enc: NewEncoder(conn, nil),
 	}
 }
 

@@ -25,7 +25,7 @@ def get_test_data_list():
          False,
          True,
          None,
-         "2012-02-02T02:02:02.000000002Z",
+         1328148122000002,
          "someday",
          "",
          "bytestring",
@@ -46,7 +46,7 @@ def get_test_data_list():
              False,
              True,
              None,
-             "2012-02-02T02:02:02.000000002Z",
+             1328148122000002,
              "someday",
              "",
              "bytestring" 
@@ -56,10 +56,11 @@ def get_test_data_list():
          { "true": "True",
            "false": False,
            "int64(0)": 0 },
-         { "list": [64, 32, True, -32.0, {"TRUE":True, "FALSE":False}, [True, False] ],
-           "int32":32, "bool": True, 
+         { "list": [1616, 32323232, True, -3232.0, {"TRUE":True, "FALSE":False}, [True, False] ],
+           "int32":32323232, "bool": True, 
            "LONG STRING": "123456789012345678901234567890123456789012345678901234567890",
-           "SHORT STRING": "1234567890" }
+           "SHORT STRING": "1234567890" },	
+	 { True: "true", 8: False, "false": 0 }
          ]
     return l
 

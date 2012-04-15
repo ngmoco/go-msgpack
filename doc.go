@@ -1,3 +1,4 @@
+
 /*
 go-msgpack - Msgpack library for Go. Provides pack/unpack and net/rpc support.
 https://github.com/ugorji/go-msgpack
@@ -40,26 +41,29 @@ Supports:
   - Standard Marshal/Unmarshal interface.
   - Standard field renaming via tags
   - Encoding from any value (struct, slice, map, primitives, pointers, interface{}, etc)
-  - Decoding into a pointer to any non-nil value (struct, slice, map, int, float32, bool, string, etc)
+  - Decoding into pointer to any non-nil value (struct, slice, map, int, float32, bool, string, etc)
   - Decoding into a nil interface{} (big)
-  - Handles time.Time transparently (using RFC3339 format).
+  - Handles time.Time transparently (as int64 UnixNano to specified resolution)
 
 Usage
 
-  dec = msgpack.NewDecoder(r)
+  dec = msgpack.NewDecoder(r, nil)
   err = dec.Decode(&v) 
   
-  enc = msgpack.NewEncoder(w)
+  enc = msgpack.NewEncoder(w, nil)
   err = enc.Encode(v) 
   
   //methods below are convenience methods over functions above.
-  data, err = msgpack.Marshal(v) 
-  err = msgpack.Unmarshal(data, &v)
+  data, err = msgpack.Marshal(v, nil) 
+  err = msgpack.Unmarshal(data, &v, nil)
 
 JSON Compatibility
 
-The Decoder decodes nil interface{} to be JSON compatible by default.
-You can tweak the OptionsMask to get whatever behaviour you want. 
+The Decoder takes options that can allow you specify that 
+your resulting map should be JSON compatible. For example,
+you can specify that all []byte be converted to strings and
+all maps be of type map[string]interface{}.
+
 See NewDecoder(...) documentation.
 
 */
@@ -68,5 +72,4 @@ package msgpack
 
 // BUG(ugorji): This package ignores anonymous (embedded) struct fields during encoding and decoding. 
 // This is in line with the behaviour of Json and Xml packages as of Go 1. 
-
 

@@ -42,20 +42,24 @@ import (
 	"sync"
 	"strings"
 	"fmt"
+	"time"
 	"errors"
-	"math"
 )
 
 var (
 	raisePanicAfterRecover = false
+
 	structInfoFieldName = "_struct"
 	
-	cachedStructFieldInfos = make(map[reflect.Type][]*structFieldInfo, 4)
+	cachedStructFieldInfos = make(map[reflect.Type]*structFieldInfos, 4)
 	cachedStructFieldInfosMutex sync.Mutex
-	
+
 	byteSliceTyp = reflect.TypeOf([]byte(nil))
 	intfSliceTyp = reflect.TypeOf([]interface{}(nil))
 	intfTyp = intfSliceTyp.Elem()
+	timeTyp = reflect.TypeOf(time.Time{})
+	mapStringIntfTyp = reflect.TypeOf(map[string]interface{}(nil))
+	mapIntfIntfTyp = reflect.TypeOf(map[interface{}]interface{}(nil))
 )
 
 type structFieldInfo struct {
@@ -67,15 +71,32 @@ type structFieldInfo struct {
 	name      string // field name
 }
 
-func getStructFieldInfos(rt reflect.Type) (sis []*structFieldInfo) {
+type structFieldInfos struct {
+	sis []*structFieldInfo
+	//encmap map[string]*structFieldInfo
+}
+
+func (sis *structFieldInfos) getForEncName(name string) *structFieldInfo {
+	for _, si := range sis.sis {
+		if si.encName == name {
+			return si
+		}
+	}
+	return nil
+	//return sis.encmap[name]
+}
+
+func getStructFieldInfos(rt reflect.Type) (sis *structFieldInfos) {
 	var ok bool
 	if sis, ok = cachedStructFieldInfos[rt]; ok {
 		return 
 	}
-
+	
 	cachedStructFieldInfosMutex.Lock()
 	defer cachedStructFieldInfosMutex.Unlock()
-
+	
+	sis = new(structFieldInfos)
+		
 	var si, siInfo *structFieldInfo
 	if f, ok := rt.FieldByName(structInfoFieldName); ok {
 		siInfo = parseStructFieldInfo(f)
@@ -92,7 +113,11 @@ func getStructFieldInfos(rt reflect.Type) (sis []*structFieldInfo) {
 				si.omitEmpty = true
 			}
 		}
-		sis = append(sis, si)
+		sis.sis = append(sis.sis, si)
+		//if sis.encmap == nil {
+		//	sis.encmap = make(map[string]*structFieldInfo, rt.NumField())
+		//}
+		//sis.encmap[si.encName] = si
 	}
 	cachedStructFieldInfos[rt] = sis
 	return
@@ -146,39 +171,6 @@ func reflectValue(v interface{}) (rv reflect.Value) {
 	return 
 }
 
-// checkByteSlice will try to ensure returned byte length = numbytes.
-// It may expand the []byte up to the capacity.
-// It panics if any checks don't pass.
-// Encoder.write and Decoder.read both use it.
-func checkByteSlice(numbytes int, bs []byte, expand bool) (int, []byte) {
-	lenbs := len(bs)
-	if numbytes < 0 {
-		numbytes = lenbs
-	}
-	switch {
-	case numbytes > lenbs:
-		capbs := cap(bs)
-		if capbs < numbytes {
-			panic(fmt.Errorf("%s: Requesting more bytes than in slice capacity: %v, " + 
-				"Slice Len: %v, Cap: %v", 
-				"msgpack.checkByteSlice", numbytes, lenbs, capbs))
-		} else if expand {
-			bs = bs[0:numbytes]
-		} else {
-			panic(fmt.Errorf("%s: Requesting more bytes than in slice length: %v, " + 
-				"Slice Len: %v, Cap: %v", 
-				"msgpack.checkByteSlice", numbytes, lenbs, capbs))
-		}
-	case numbytes < lenbs:
-		bs = bs[0:numbytes]
-	}
-	return numbytes, bs
-}
-
-func isMask(v int, mask int) bool {
-	return (v & mask) == mask
-}
-
 func panicToErr(err *error) {
 	if x := recover(); x != nil { 
 		panicToErrT(x, err)
@@ -201,34 +193,6 @@ func panicToErrT(panicVal interface{}, err *error) {
 	return
 }
 
-func indir(rv reflect.Value, finalTyp reflect.Type, maxDepth int) reflect.Value {
-	if !rv.IsValid() {
-		return rv
-	}
-	//treat intfType as nil (and just flatten all the way)
-	if finalTyp == intfTyp {
-		finalTyp = nil
-	}
-	if maxDepth <= 0 {
-		maxDepth = math.MaxInt16
-	}
-	for i := 0; i < maxDepth; i++ {
-		if finalTyp != nil && rv.Type() == finalTyp {
-			break
-		}
-		rk := rv.Kind()
-		if !(rk == reflect.Ptr || rk == reflect.Interface) {
-			break
-		}
-		rv2 := rv.Elem()
-		if !rv2.IsValid() {
-			break
-		}
-		rv = rv2
-	}
-	return rv
-}
-
 func isEmptyValue(v reflect.Value) bool {
 	switch v.Kind() {
 	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
@@ -247,4 +211,39 @@ func isEmptyValue(v reflect.Value) bool {
 	return false
 }
 
+func approxDataSize(rv reflect.Value, inclContainerSize bool, inclNonDataSize bool) (sum int) {
+	if !rv.IsValid() {
+		return
+	}
+	switch rk := rv.Kind(); rk {
+	case reflect.Invalid:
+	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		if inclNonDataSize { sum += int(rv.Type().Size()) }
+	case reflect.Ptr, reflect.Interface:
+		if inclNonDataSize { sum += int(rv.Type().Size()) }
+		sum += approxDataSize(rv.Elem(), inclContainerSize, inclNonDataSize)
+    case reflect.Array, reflect.Slice:
+		if inclContainerSize { sum += int(rv.Type().Size()) }
+		for j := 0; j < rv.Len(); j++ {
+			sum += approxDataSize(rv.Index(j), inclContainerSize, inclNonDataSize)
+		}
+    case reflect.String:
+		if inclContainerSize { sum += int(rv.Type().Size()) }
+		sum += rv.Len()
+    case reflect.Map:
+		if inclContainerSize { sum += int(rv.Type().Size()) }
+		for _, mk := range rv.MapKeys() {
+			sum += approxDataSize(mk, inclContainerSize, inclNonDataSize)
+			sum += approxDataSize(rv.MapIndex(mk), inclContainerSize, inclNonDataSize)
+		}
+    case reflect.Struct:
+		if inclContainerSize { sum += int(rv.Type().Size()) }
+		for j := 0; j < rv.NumField(); j++ {
+			sum += approxDataSize(rv.Field(j), inclContainerSize, inclNonDataSize)
+		}		
+	default:
+		sum += int(rv.Type().Size())
+	}
+	return
+}
 

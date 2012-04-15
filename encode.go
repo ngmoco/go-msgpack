@@ -51,29 +51,48 @@ import (
 	"encoding/binary"
 )
 
+const (
+	SEC  TimeResolution = iota // seconds
+	MSEC                       // milliseconds (seconds / 1 000)
+	USEC                       // microseconds (seconds / 1 000 000)
+	NSEC                       // nanoseconds  (seconds / 1 000 000 000)
+)
+
 // Some tagging information for error messages.
 var (
 	msgTagEnc = "msgpack.encoder"
 )
 
+// TimeResolution describes the resolution with which to encode/decode time.
+type TimeResolution int
+
 // An Encoder writes an object to an output stream in the msgpack format.
 type Encoder struct {
-	t []byte        //temp byte array re-used internally for efficiency
 	w io.Writer
+	opt EncoderOptions
+	t []byte        //temp byte array re-used internally for efficiency
+}
+
+type EncoderOptions struct {
+	// when encoding a time to Unix, what resolution do we use.
+	TimeResolution TimeResolution
 }
 
 // NewDecoder returns an Encoder for encoding an object.
-func NewEncoder(w io.Writer) (*Encoder) {
-	return &Encoder{
-		w: w,
-		t: make([]byte, 0, 16),
-	}
+// If nil options are passed, we use a Encoder with options:
+//    option: TimeResolution:          USEC
+func NewEncoder(w io.Writer, opts *EncoderOptions) (*Encoder) {	
+	if opts == nil {
+		opts = &EncoderOptions{USEC}
+	} 
+	return &Encoder{w, *opts, make([]byte, 0, 16)}
 }
 
 // Encode writes an object into a stream in the MsgPack format.
 // 
-// time.Time is handled transparently. We can encode a time.Time struct or pointer
-// in RFC3339 format.
+// time.Time is handled transparently.  We will encode to and from a int64 Unix time 
+// (ie number of nanoseconds since Jan 1, 1970 Epoch) based on the resolution in the 
+// EncoderOptions.
 // 
 // Struct values encode as maps. Each exported struct field is encoded
 // unless:
@@ -119,14 +138,8 @@ func (e *Encoder) encode(v interface{}) {
 }
 
 func (e *Encoder) encodeValue(rv reflect.Value) {
-	// don't indirect everytime, just when you need to (if reflect.Ptr/Interface).
-	// This shaved about 20% from encoding time.
-	//rv = indir(rv, nil, -1)
-	
 	if !rv.IsValid() {
-		e.t = e.t[0:1]
-		e.t[0] = 0xc0
-		e.write(-1)
+		e.encNil()
 		return
 	}
 	
@@ -135,6 +148,10 @@ func (e *Encoder) encodeValue(rv reflect.Value) {
 	
 	switch rk := rv.Kind(); rk {
 	case reflect.Slice, reflect.Array:
+		if rv.IsNil() {
+			e.encNil()
+			break
+		}
 		rawbytes := false
 		if rv.Type() == byteSliceTyp {
 			rawbytes = true
@@ -142,31 +159,35 @@ func (e *Encoder) encodeValue(rv reflect.Value) {
 		l := rv.Len()
 		e.writeContainerLen(rawbytes, true, l)
 		if rawbytes {
-			e.writeb(l, rv.Interface().([]byte))
+			e.writeb(l, rv.Bytes())
 			break
 		} 
 		for j := 0; j < l; j++ {
 			e.encode(rv.Index(j))
 		}
 	case reflect.Map:
+		if rv.IsNil() {
+			e.encNil()
+			break
+		}
 		e.writeContainerLen(false, false, rv.Len())
 		for _, mk := range rv.MapKeys() {
 			e.encode(mk)
 			e.encode(rv.MapIndex(mk))
 		}
 	case reflect.Struct:
+		rt := rv.Type()
 		//treat time.Time specially
-		if tt, ok := rv.Interface().(time.Time); ok {
-			e.encode(tt.Format(time.RFC3339Nano))
+		if rt == timeTyp {
+			tnano := rv.Interface().(time.Time).UnixNano()
+			e.encTime(tnano)
 			break
 		}
-		rt := rv.Type()
 		sis := getStructFieldInfos(rt)
-		encNames := make([]string, len(sis))
-		rvals := make([]reflect.Value, len(sis))
+		encNames := make([]string, len(sis.sis))
+		rvals := make([]reflect.Value, len(sis.sis))
 		newlen := 0
-		for _, si := range sis {
-			//rval0 := rv.FieldByName(si.name) (significantly faster to skip FieldByName)
+		for _, si := range sis.sis {
 			rval0 := rv.Field(si.i)
 			if si.omitEmpty && isEmptyValue(rval0) {
 				continue
@@ -190,11 +211,14 @@ func (e *Encoder) encodeValue(rv reflect.Value) {
 	case reflect.String:
 		e.encode([]byte(rv.String()))
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		e.encInt64(rv.Int())
+		e.encInt(rv.Int())
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		e.encUint64(rv.Uint())
+		e.encUint(rv.Uint())
 	case reflect.Ptr, reflect.Interface:
-		//possible a "nil" ptr/interface gets here; should be caught next time around
+		if rv.IsNil() {
+			e.encNil()
+			break
+		}
 		e.encodeValue(rv.Elem())
 	default:
 		panic(fmt.Errorf("%s: Unsupported kind: %s, for: %#v", msgTagEnc, rk, rv))
@@ -224,7 +248,13 @@ func (e *Encoder) writeContainerLen(rawbytes bool, slicelike bool, l int) {
 		e.t[0] = b2
 		binary.BigEndian.PutUint32(e.t[1:], uint32(l))
 	}
-	e.write(-1)
+	e.write()
+}
+
+func (e *Encoder) encNil() {
+	e.t = e.t[0:1]
+	e.t[0] = 0xc0
+	e.write()
 }
 
 func (e *Encoder) encBool(b bool) {	
@@ -234,10 +264,10 @@ func (e *Encoder) encBool(b bool) {
 	} else {
 		e.t[0] = 0xc2
 	}
-	e.write(-1)
+	e.write()
 }
 
-func (e *Encoder) encInt64(i int64) {
+func (e *Encoder) encInt(i int64) {
 	switch {
 	case i < math.MinInt32 || i > math.MaxInt32:
 		e.t = e.t[0:9]
@@ -260,18 +290,18 @@ func (e *Encoder) encInt64(i int64) {
 	default:
 		panic("encInt64: Unreachable block")
 	}
-	e.write(-1)
+	e.write()
 }
 
-func (e *Encoder) encUint64(i uint64) {
-	e._encUint64(false, false, i)
+func (e *Encoder) encUint(i uint64) {
+	e.encUintFl(false, false, i)
 }
 
 func (e *Encoder) encFloat(f32 bool, i uint64) {
-	e._encUint64(f32, !f32, i)
+	e.encUintFl(f32, !f32, i)
 }
 
-func (e *Encoder) _encUint64(f32 bool, f64 bool, i uint64) {
+func (e *Encoder) encUintFl(f32 bool, f64 bool, i uint64) {
 	switch {
 	case f32:
 		e.t = e.t[0:5]
@@ -300,21 +330,38 @@ func (e *Encoder) _encUint64(f32 bool, f64 bool, i uint64) {
 		e.t[0] = 0xcf
 		binary.BigEndian.PutUint64(e.t[1:], i)
 	}
-	e.write(-1)
+	e.write()
 	return
 }
 
-func (e *Encoder) write(numbytes int) {
-	e.t = e.writeb(numbytes, e.t)
+func (e *Encoder) encTime(tnano int64) {
+	//e.encode(tnano / 1e3); return
+	//TODO: Perf: This switch statement increases encode time by 30% (169us to 242us)
+	//when in calling function. Moving to its own functions to fix.
+	switch e.opt.TimeResolution {
+	case SEC:  
+		tnano = tnano / 1e9
+	case MSEC: 
+		tnano = tnano / 1e6
+	case USEC: 
+		tnano = tnano / 1e3
+	case NSEC: 
+	default: 
+		panic(fmt.Errorf("%s: Invalid Time Resolution: %d", msgTagEnc, e.opt.TimeResolution))
+	}
+	e.encode(tnano)
+}
+
+func (e *Encoder) write() {
+	e.writeb(len(e.t), e.t)
 }
 
 func (e *Encoder) writeb(numbytes int, bs []byte) []byte {
-	numbytes, bs = checkByteSlice(numbytes, bs, false)
 	n, err := e.w.Write(bs)
-	switch {
-	case err != nil:
+	if err != nil {
 		panic(err)
-	case n != numbytes:
+	}
+	if n != numbytes {
 		panic(fmt.Errorf("%s: write: Incorrect num bytes read. Expecting: %v, Wrote: %v", 
 			msgTagEnc, numbytes, n))
 	}
@@ -323,9 +370,9 @@ func (e *Encoder) writeb(numbytes int, bs []byte) []byte {
 
 // Marshal is a convenience function which encodes v to a stream of bytes. 
 // It delegates to Encoder.Encode.
-func Marshal(v interface{}) (b []byte, err error) {
+func Marshal(v interface{}, opts *EncoderOptions) (b []byte, err error) {
 	bs := new(bytes.Buffer)
-	if err = NewEncoder(bs).Encode(v); err == nil {
+	if err = NewEncoder(bs, opts).Encode(v); err == nil {
 		b = bs.Bytes()
 	}
 	return

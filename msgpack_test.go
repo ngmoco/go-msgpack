@@ -68,10 +68,17 @@ import (
 
 var (
 	testLogToT = true
+	failNowOnFail = false
+	testShowLog = true
 	skipVerifyVal interface{} = &(struct{}{})
+	timeToCompare = time.Date(2012, 2, 2, 2, 2, 2, 2000, time.UTC) //time.Time{} //
+	//"2012-02-02T02:02:02.000002000Z" //1328148122000002
+	timeToCompareAs interface{} = timeToCompare.UnixNano() 
 	table []interface{}               // main items we encode
 	tableVerify []interface{}         // we verify encoded things against this after decode
 	tableTestNilVerify []interface{}  // for nil interface, use this to verify (rules are different)
+	tablePythonVerify []interface{}   // for verifying for python, since Python sometimes
+                                          // will encode a float32 as float64, or large int as uint
 )
 
 type TestStruc struct {
@@ -93,19 +100,21 @@ type TestStruc struct {
 	
 	Islice []interface{}
 	
-	M map[interface{}]interface{}
+	//M map[interface{}]interface{}  `json:"-",bson:"-"`
+	Ms map[string]interface{}
 	Msi64 map[string]int64
 	
-	N interface{} //don't set this, so we can test for nil
-	T time.Time
+	Nintf interface{}    //don't set this, so we can test for nil
+	T time.Time          
+	Nmap map[string]bool //don't set this, so we can test for nil
+	Nslice []byte        //don't set this, so we can test for nil
+	Nint64 *int64
+	Nteststruc *TestStruc
 }
 
 func init() {
 	_, _ = fmt.Printf, os.Remove
-
-	// Note that if a map key type is interface{}, then it will be decoded to a nil interface{}
-	// so we have to expect max-size objects (e.g. int64, uint64, etc).
-	table = []interface{}{
+	primitives := []interface{}{
 		int8(-8),
 		int16(-1616),
 		int32(-32323232),
@@ -122,32 +131,12 @@ func init() {
 		false,
 		true,
 		nil,
-		time.Date(2012, 2, 2, 2, 2, 2, 2, time.UTC),
+		timeToCompare,
 		"someday",
 		"",
-		[]byte("bytestring"),
-		[]interface{}{
-			int64(-8),
-			int64(-1616),
-			int64(-32323232),
-			int64(-6464646464646464),
-			int64(8),
-			uint64(1616),
-			uint64(32323232),
-			uint64(6464646464646464),
-			int64(8),
-			float64(-3232.0),
-			float64(-6464646464.0),
-			float64(3232.0),
-			float64(6464646464.0),
-			false,
-			true,
-			nil,
-			"2012-02-02T02:02:02.000000002Z",
-			"someday",
-			"",
-			"bytestring",
-		},
+		"bytestring",
+	}
+	mapsAndStrucs := []interface{}{
 		map[string]bool{
 			"true":true,
 			"false":false,
@@ -155,139 +144,112 @@ func init() {
 		map[string]interface{}{
 			"true": "True",
 			"false": false,
-			"int64(0)": int64(0),
+			"int64(0)": int8(0),
 		},
 		//add a complex combo map in here. (map has list which has map)
 		//note that after the first thing, everything else should be generic.
 		map[string]interface{}{
 			"list": []interface{}{
-				int64(64),
-				int64(32),
+				int16(1616),
+				int32(32323232),
 				true,
-				float64(-32.0),
+				float32(-3232.0),
 				map[string]interface{} {
 					"TRUE":true,
 					"FALSE":false,
 				},
 				[]interface{}{true, false},
 			},
-			"int32": int64(32),
+			"int32": int32(32323232),
 			"bool": true,
 			"LONG STRING": "123456789012345678901234567890123456789012345678901234567890",
 			"SHORT STRING": "1234567890",
 		},
 		map[interface{}]interface{}{
 			true: "true",
-			int64(9): false,
-			"false": int64(0),
+			int8(8): false,
+			"false": int8(0),
 		},
-		newTestStruc(),
+		newTestStruc(0),
 	}
 	
+	table = []interface{}{}
+	table = append(table, primitives...)    //0-19 are primitives
+	table = append(table, primitives)       //20 is a list of primitives
+	table = append(table, mapsAndStrucs...) //21-24 are maps. 25 is a *struct
+
 	// we verify against the same table, but skip 23 
 	// because interface{} equality is not defined exact for exact objects or nil.
-	tableVerify = make([]interface{}, len(table))
-	copy(tableVerify, table)
-	tableVerify[23] = skipVerifyVal
+	var a, b []interface{}
+	var c map[string]interface{}
+	a = make([]interface{}, len(table))
+	copy(a, table)
+	b = make([]interface{}, len(a[20].([]interface{})))
+	copy(b, a[20].([]interface{}))
+	a[20] = b
+	b[0], b[4], b[8], b[16], b[19] = int8(-8), int8(8), int8(8), int64(1328148122000002), "bytestring"
+	a[23] = skipVerifyVal 
+	//a[25] = skipVerifyVal
+	tableVerify = a
 	
-	// For items decoded to a nil interface, the rules are different 
-	// e.g. all primitives are 64-bit long (int64, uint64, float64, etc)
-	// and all items are map[interface{}]interface{} except the required
-	// bit mask is set.
-	tableTestNilVerify = []interface{}{
-		int64(-8),
-		int64(-1616),
-		int64(-32323232),
-		int64(-6464646464646464),
-		int64(8),
-		uint64(1616),
-		uint64(32323232),
-		uint64(6464646464646464),
-		int64(8),
-		float64(-3232.0),
-		float64(-6464646464.0),
-		float64(3232.0),
-		float64(6464646464.0),
-		false,
-		true,
-		nil,
-		"2012-02-02T02:02:02.000000002Z",
-		"someday",
-		"",
-		"bytestring",
-		[]interface{}{
-			int64(-8),
-			int64(-1616),
-			int64(-32323232),
-			int64(-6464646464646464),
-			int64(8),
-			uint64(1616),
-			uint64(32323232),
-			uint64(6464646464646464),
-			int64(8),
-			float64(-3232.0),
-			float64(-6464646464.0),
-			float64(3232.0),
-			float64(6464646464.0),
-			false,
-			true,
-			nil,
-			"2012-02-02T02:02:02.000000002Z",
-			"someday",
-			"",
-			"bytestring",
-		},
-		map[string]interface{}{
-			"true":true,
-			"false":false,
-		},
-		map[string]interface{}{
-			"true": "True",
-			"false": false,
-			"int64(0)": int64(0),
-		},
-		map[string]interface{}{
-			"list": []interface{}{
-				int64(64),
-				int64(32),
-				true,
-				float64(-32.0),
-				map[string]interface{} {
-					"TRUE":true,
-					"FALSE":false,
-				},
-				[]interface{}{true, false},
-			},
-			"int32": int64(32),
-			"bool": true,
-			"LONG STRING": "123456789012345678901234567890123456789012345678901234567890",
-			"SHORT STRING": "1234567890",
-		},
-		skipVerifyVal, //map[intf]intf cannot be compared for equality (equal undefined on key)
-		skipVerifyVal,
+	//when decoding into nil, for testing, 
+	//we treat each []byte as string, and uint < 127 are decoded as int8.
+	a = make([]interface{}, len(tableVerify))
+	copy(a, tableVerify)
+	a[0], a[4], a[8], a[16], a[19] = int8(-8), int8(8), int8(8), int64(1328148122000002), "bytestring"
+	a[21] = map[string]interface{}{"true":true, "false":false}
+	a[23] = table[23]
+	a[25] = skipVerifyVal
+	tableTestNilVerify = a
+	
+	//python msgpack encodes large positive numbers as unsigned, and all floats as float64
+	a = make([]interface{}, len(tableTestNilVerify)-2)
+	copy(a, tableTestNilVerify)
+	a[23] = table[23]
+	a[9], a[11], a[16] = float64(-3232.0), float64(3232.0), uint64(1328148122000002)
+	b = make([]interface{}, len(a[20].([]interface{})))
+	copy(b, a[20].([]interface{}))
+	a[20] = b
+	b[9], b[11], b[16] = float64(-3232.0), float64(3232.0), uint64(1328148122000002)
+	c = make(map[string]interface{})
+	for k, v := range a[23].(map[string]interface{}) { 
+		c[k] = v
 	}
-	
+	a[23] = c
+	c["int32"] = uint32(32323232)
+	b = c["list"].([]interface{})
+	b[0], b[1], b[3] = uint16(1616), uint32(32323232), float64(-3232.0)
+	tablePythonVerify = a
 }
 
-func lf(t *testing.T, format string, args ...interface{}) {
-	if testLogToT {
-		t.Logf(format, args...)		
-	} else {
-		if format[len(format)-1] != '\n' {
+func lf(x interface{}, format string, args ...interface{}) {
+	if t, ok := x.(*testing.T); ok && t != nil && testLogToT {
+		t.Logf(format, args...)	
+	} else if b, ok := x.(*testing.B); ok && b != nil && testLogToT {
+		b.Logf(format, args...)
+	} else if testShowLog {
+		if len(format) == 0 || format[len(format)-1] != '\n' {
 			format = format + "\n"
 		}
 		fmt.Printf(format, args...)
 	}
 }
 
-func newTestStruc() TestStruc {
-	//use uint64, int64, float64 when doing interface{} values, as those are the ones converted into 
-	ts := TestStruc {
+func failT(t *testing.T) {
+	if failNowOnFail {
+		t.FailNow()
+	} else {
+		t.Fail()
+	}
+}
+
+func newTestStruc(depth int) (ts TestStruc) {
+	ts = TestStruc {
 		S: "some string",
 		I64: 64,
 		I16: 16,
 		Ui64: 64,
-		Ui8: 8,
+		Ui8: 160,
 		B: true,
 		By: 5,
 		
@@ -299,24 +261,33 @@ func newTestStruc() TestStruc {
 		Bslice: []bool{true, false, true, false},
 		Byslice: []byte{13, 14, 15},
 		
-		Islice: []interface{}{"true", true, "no", false, int64(0), float64(0.4)},
+		Islice: []interface{}{"true", true, "no", false, int8(88), float64(0.4)},
 		
-		M: map[interface{}]interface{}{
-			true: "true",
-			int64(9): false,
+		//remove this one, as json and bson require string keys in maps.
+		//M: map[interface{}]interface{}{
+		//	true: "true",
+		//	int64(9): false,
+		//},
+		Ms: map[string]interface{}{
+			"true": "true",
+			"int64(9)": false,
 		},
-		
 		Msi64: map[string]int64{
 			"one": 1,
 			"two": 2,
 		},
-		T: time.Date(2012, 2, 2, 2, 2, 2, 2, time.UTC),
+		T: timeToCompare,
 	}
-	return ts
+	if depth > 0 {
+		depth--
+		ts.Ms["TestStruc." + strconv.Itoa(depth)] = newTestStruc(depth)
+		ts.Islice = append(ts.Islice, newTestStruc(depth))
+	}
+	return
 }
 
 // doTestMsgpacks allows us test for different variations based on arguments passed.
-func doTestMsgpacks(t *testing.T, testNil bool, decodeMask int, 
+func doTestMsgpacks(t *testing.T, testNil bool, opts *DecoderOptions,	
 	vs []interface{}, vsVerify []interface{}) {
 	//if testNil, then just test for when a pointer to a nil interface{} is passed. It should work.
 	//Current setup allows us test (at least manually) the nil interface or typed interface.
@@ -325,20 +296,17 @@ func doTestMsgpacks(t *testing.T, testNil bool, decodeMask int,
 	for i, v0 := range vs {
 		lf(t, "..............................................")
 		lf(t, "         Testing: #%d: %T, %#v\n", i, v0, v0)
-		b0, err := Marshal(v0)
+		b0, err := Marshal(v0, nil)
 		if err != nil {
 			lf(t, err.Error())
-			t.Fail()
+			failT(t)
 			continue
 		}
 		lf(t, "         Encoded bytes: len: %v, %v\n", len(b0), b0)
 		
 		var v1 interface{}
 		
-		dec := NewDecoder(bytes.NewBuffer(b0))
-		if decodeMask > 0 {
-			dec.OptionsMask = decodeMask
-		}
+		dec := NewDecoder(bytes.NewBuffer(b0), opts)
 		if testNil {
 			err = dec.Decode(&v1)
 		} else {
@@ -358,7 +326,7 @@ func doTestMsgpacks(t *testing.T, testNil bool, decodeMask int,
 		//v1 = indirIntf(v1, nil, -1)
 		if err != nil {
 			lf(t, "-------- Error: %v. Partial return: %v", err, v1)
-			t.Fail()
+			failT(t)
 			continue
 		}
 		v0check := vsVerify[i]
@@ -371,33 +339,55 @@ func doTestMsgpacks(t *testing.T, testNil bool, decodeMask int,
 			lf(t, "++++++++ Before and After marshal matched\n")
 		} else {
 			lf(t, "-------- Before and After marshal do not match: " + 
-				"(%T). Decoded: %T, %#v\n", v0, v1, v1)
-			t.Fail()
+				"(%T). ====> AGAINST: %T, %#v, DECODED: %T, %#v\n", v0, v0check, v0check, v1, v1)
+			failT(t)
 		}
 	}
 }
 
 func TestMsgpacks(t *testing.T) {	
-	doTestMsgpacks(t, false, MASK_B2S_SLICE_ELEMENT | MASK_B2S_MAP_VALUE, table, tableVerify) 
-	doTestMsgpacks(t, true, -1, table[:24], tableTestNilVerify[:24]) 
-	doTestMsgpacks(t, true, MASK_B2S_SLICE_ELEMENT | MASK_B2S_MAP_VALUE, table[24:], 
-		tableTestNilVerify[24:]) 
+	doTestMsgpacks(t, false, &DecoderOptions{nil, nil, false, true, true, USEC}, table, tableVerify) 
+	doTestMsgpacks(t, true,  &DecoderOptions{mapStringIntfTyp, nil, true, true, true, USEC}, 
+		table[:24], tableTestNilVerify[:24]) 
+	doTestMsgpacks(t, true, &DecoderOptions{nil, nil, false, true, true, USEC}, 
+		table[24:], tableTestNilVerify[24:]) 
 }
 
 func TestDecodeToTypedNil(t *testing.T) {
-	b, err := Marshal(32)
+	b, err := Marshal(32, nil)
 	var i *int32
-	if err = Unmarshal(b, i); err == nil {
+	if err = Unmarshal(b, i, nil); err == nil {
 		lf(t, "------- Expecting error because we cannot unmarshal to int32 nil ptr")
 		t.FailNow()
 	}
 	var i2 int32 = 0
-	if err = Unmarshal(b, &i2); err != nil {
+	if err = Unmarshal(b, &i2, nil); err != nil {
 		lf(t, "------- Cannot unmarshal to int32 ptr. Error: %v", err)
 		t.FailNow()
 	}
 	if i2 != int32(32) {
 		lf(t, "------- didn't unmarshal to 32: Received: %d", *i)
+		t.FailNow()
+	}
+}
+
+func TestDecodePtr(t *testing.T) {
+	ts := newTestStruc(0)
+	b, err := Marshal(&ts, nil)
+	if err != nil {
+		lf(t, "------- Cannot Marshal pointer to struct. Error: %v", err)
+		t.FailNow()
+	} else if len(b) < 40 {
+		lf(t, "------- Size must be > 40. Size: %d", len(b))
+		t.FailNow()
+	}
+	ts2 := new(TestStruc)
+	err = Unmarshal(b, &ts2, nil)
+	if err != nil {
+		lf(t, "------- Cannot Unmarshal pointer to struct. Error: %v", err)
+		t.FailNow()
+	} else if ts2.I64 != 64 {
+		lf(t, "------- Unmarshal wrong. Expect I64 = 64. Got: %v", ts2.I64)
 		t.FailNow()
 	}
 }
@@ -424,16 +414,17 @@ func TestPythonGenStreams(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpdir)
 	lf(t, "tmpdir: %v", tmpdir)
-	cmd := exec.Command("python", "build.py", "testdata", tmpdir)
+	cmd := exec.Command("python", "helper.py", "testdata", tmpdir)
 	//cmd.Stdin = strings.NewReader("some input")
 	//cmd.Stdout = &out
-	if err = cmd.Run(); err != nil {
+	var cmdout []byte
+	if cmdout, err = cmd.CombinedOutput(); err != nil {
 		lf(t, "-------- Error running python build.py. Err: %v", err)
+		lf(t, "         %v", string(cmdout))
 		t.FailNow()
 	}
 	
-	bss := make([][]byte, len(tableTestNilVerify) - 2)
-	for i, v := range tableTestNilVerify[0:len(tableTestNilVerify) - 2] {
+	for i, v := range tablePythonVerify {
 		//load up the golden file based on number
 		//decode it
 		//compare to in-mem object
@@ -441,17 +432,22 @@ func TestPythonGenStreams(t *testing.T) {
 		//compare to output stream
 		lf(t, "..............................................")
 		lf(t, "         Testing: #%d: %T, %#v\n", i, v, v) 
-		bss[i], err = ioutil.ReadFile(filepath.Join(tmpdir, strconv.Itoa(i) + ".golden"))
+		var bss []byte
+		bss, err = ioutil.ReadFile(filepath.Join(tmpdir, strconv.Itoa(i) + ".golden"))
 		if err != nil {
 			lf(t, "-------- Error reading golden file: %d. Err: %v", i, err)
-			t.Fail()
+			failT(t)
 			continue
 		}
-		dec := NewDecoder(bytes.NewBuffer(bss[i]))
+		dec := NewDecoder(bytes.NewBuffer(bss),
+			&DecoderOptions{mapStringIntfTyp, nil, true, true, true, USEC})
 		var v1 interface{}
 		if err = dec.Decode(&v1); err != nil {
 			lf(t, "-------- Error decoding stream: %d: Err: %v", i, err)
-			t.Fail()
+			failT(t)
+			continue
+		}
+		if v == skipVerifyVal {
 			continue
 		}
 		//no need to indirect, because we pass a nil ptr, so we already have the value 
@@ -462,15 +458,15 @@ func TestPythonGenStreams(t *testing.T) {
 			lf(t, "-------- Objects do not match: Source: %T. Decoded: %T", v, v1)
 			lf(t, "--------   AGAINST: %#v", v)
 			lf(t, "--------   DECODED: %#v", v1)
-			t.Fail()
+			failT(t)
 		}
 		bsb := new(bytes.Buffer)
-		if err = NewEncoder(bsb).Encode(v1); err != nil {
+		if err = NewEncoder(bsb, nil).Encode(v1); err != nil {
 			lf(t, "Error encoding to stream: %d: Err: %v", i, err)
-			t.Fail()
+			failT(t)
 			continue
 		}
-		if reflect.DeepEqual(bsb.Bytes(), bss[i]) { 
+		if reflect.DeepEqual(bsb.Bytes(), bss) { 
 			lf(t, "++++++++ Bytes match")
 		} else {
 			lf(t, "???????? Bytes do not match")
@@ -480,9 +476,9 @@ func TestPythonGenStreams(t *testing.T) {
 				lf(t, "%s It's a map. Ok that they don't match (dependent on ordering).", xs)
 			} else {
 				lf(t, "%s It's not a map. They should match.", xs)
-				t.Fail()
+				failT(t)
 			}
-			lf(t, "%s   FROM_FILE: %4d] %v", xs, len(bss[i]), bss[i])
+			lf(t, "%s   FROM_FILE: %4d] %v", xs, len(bss), bss)
 			lf(t, "%s     ENCODED: %4d] %v", xs, len(bsb.Bytes()), bsb.Bytes())
 		}
 	}
