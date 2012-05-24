@@ -68,12 +68,16 @@ const fourItemArray = 0x94
 //   ... (see rpc package for how to use an rpc client)
 // 
 func NewMsgRPCCodec(conn io.ReadWriteCloser) *msgrpcCodec {
+	return NewMsgRPCCodecWithOptions(conn, nil, nil)
+}
+
+func NewMsgRPCCodecWithOptions(conn io.ReadWriteCloser, dopts *DecoderOptions, eopts *EncoderOptions) *msgrpcCodec {
 	//don't use a bufio Reader, because you don't want to read more than is necessary
 	//this is because multiple requests can use one connection.
 	return &msgrpcCodec{
 		rwc: conn,
-		dec: NewDecoder(conn, nil),
-		enc: NewEncoder(conn, nil),
+		dec: NewDecoder(conn, dopts),
+		enc: NewEncoder(conn, eopts),
 	}
 }
 
