@@ -23,19 +23,21 @@ Supports:
 Usage
 -----
 
->  dec = msgpack.NewDecoder(r, nil)
->  err = dec.Decode(&v) 
->  
->  enc = msgpack.NewEncoder(w)
->  err = enc.Encode(v) 
->  
->  //methods below are convenience methods over functions above.
->  data, err = msgpack.Marshal(v) 
->  err = msgpack.Unmarshal(data, &v, nil)
->  
->  //RPC Communication
->  conn, err = net.Dial("tcp", "localhost:5555")
->  rpcCodec := msgpack.NewRPCCodec(conn, nil, true)
->  client := rpc.NewClientWithCodec(rpcCodec)
+<pre>
 
+    dec = msgpack.NewDecoder(r, nil)  
+    err = dec.Decode(&v)  
+    
+    enc = msgpack.NewEncoder(w)  
+    err = enc.Encode(v)  
+    
+    //methods below are convenience methods over functions above.  
+    data, err = msgpack.Marshal(v)  
+    err = msgpack.Unmarshal(data, &v, nil)  
+    
+    //RPC Communication  
+    conn, err = net.Dial("tcp", "localhost:5555")  
+    rpcCodec := msgpack.NewRPCCodec(conn, nil, true)  
+    client := rpc.NewClientWithCodec(rpcCodec)  
 
+</pre>
