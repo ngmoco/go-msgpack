@@ -41,46 +41,42 @@ import (
 	"reflect"
 	"time"
 	"runtime"
+	"flag"
 )
 
 var (
+	//depth of 0 maps to ~400bytes json-encoded string, 1 maps to ~1400 bytes, etc
+	benchDepth = 0
 	benchBs []byte
 	benchTs TestStruc
-	//depth of 0 maps to ~400bytes json-encoded string, 1 maps to ~1400 bytes, etc
-	benchDepth = 0 
+
+	benchDoInitBench = flag.Bool("mb", false, "Run Bench Init")
 )
 
 type benchFn func(buf *bytes.Buffer, ts *TestStruc) error
 
-var (
-	benchDoInitBench = true
-)
-
 func init() {
+	flag.Parse()
 	gob.Register(new(TestStruc))
-	benchTs = newTestStruc(benchDepth)
-	approxSize := approxDataSize(reflect.ValueOf(benchTs), true, true)
+	benchTs = newTestStruc(benchDepth, true)
+	approxSize := approxDataSize(reflect.ValueOf(benchTs))
 	//benchBs = make([]byte, 1024 * 4 * d) 
 	//initialize benchBs large enough to hold double approx size 
 	//(to fit all encodings without expansion)
 	benchBs = make([]byte, approxSize * 2) 
-	if benchDoInitBench {
-		lf(nil, "")
-		lf(nil, "..............................................")
-		lf(nil, "BENCHMARK INIT: %v", time.Now())
-		lf(nil, "TO RUN FULL BENCHMARK comparing MsgPack, JSON,BSON,GOB, " + 
+	if *benchDoInitBench {
+		logT(nil, "")
+		logT(nil, "..............................................")
+		logT(nil, "BENCHMARK INIT: %v", time.Now())
+		logT(nil, "TO RUN FULL BENCHMARK comparing MsgPack, JSON,BSON,GOB, " + 
 			"use \"go test -test.bench .\"")
-		lf(nil, "Benchmark: " + 
+		logT(nil, "Benchmark: " + 
 			"\n\tinit []byte size:                   %d, " +
 			"\n\tStruct recursive Depth:             %d, " + 
 			"\n\tApproxDeepSize Of benchmark Struct: %d, ", 
 			len(benchBs), benchDepth, approxSize, )
-		oldShowLog := testShowLog
-		testShowLog = false
 		benchCheck()
-		testShowLog = oldShowLog
-		benchCheck()
-		lf(nil, "..............................................")
+		logT(nil, "..............................................")
 	}	
 }
 
@@ -92,21 +88,21 @@ func benchCheck() {
 		runtime.GC()
 		tnow := time.Now()
 		if err = encfn(buf, &benchTs); err != nil {
-			lf(nil, "\t%10s: **** Error encoding benchTs: %v", name, err)
+			logT(nil, "\t%10s: **** Error encoding benchTs: %v", name, err)
 		} 
 		encDur := time.Now().Sub(tnow)
 		encLen := buf.Len()
-		//fmt.Printf("\t%10s: encLen: %v, len: %v, cap: %v\n", name, encLen, len(benchBs), cap(benchBs))
+		//log("\t%10s: encLen: %v, len: %v, cap: %v\n", name, encLen, len(benchBs), cap(benchBs))
 		buf = bytes.NewBuffer(benchBs[0:encLen])
 		runtime.GC()
 		tnow = time.Now()
 		if err = decfn(buf, new(TestStruc)); err != nil {
-			lf(nil, "\t%10s: **** Error decoding into new TestStruc: %v", name, err)
+			logT(nil, "\t%10s: **** Error decoding into new TestStruc: %v", name, err)
 		}
 		decDur := time.Now().Sub(tnow)
-		lf(nil, "\t%10s: Encode Size: %5d, Encode Time: %8v, Decode Time: %8v", name, encLen, encDur, decDur)
+		logT(nil, "\t%10s: Encode Size: %5d, Encode Time: %8v, Decode Time: %8v", name, encLen, encDur, decDur)
 	}
-	lf(nil, "Benchmark One-Pass Unscientific Marshal Sizes:")
+	logT(nil, "Benchmark One-Pass Unscientific Marshal Sizes:")
 	fn("msgpack", fnMsgpackEncodeFn, fnMsgpackDecodeFn)
 	fn("gob", fnGobEncodeFn, fnGobDecodeFn)
 	fn("bson", fnBsonEncodeFn, fnBsonDecodeFn)
@@ -114,13 +110,14 @@ func benchCheck() {
 }
 
 func fnBenchmarkEncode(b *testing.B, encfn benchFn) {
+	//benchOnce.Do(benchInit)
 	runtime.GC()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		benchBs = benchBs[0:0]
 		buf := bytes.NewBuffer(benchBs)
 		if err := encfn(buf, &benchTs); err != nil {
-			lf(b, "Error encoding benchTs: %v", err)
+			logT(b, "Error encoding benchTs: %v", err)
 			b.FailNow()
 		}
 	}
@@ -131,7 +128,7 @@ func fnBenchmarkDecode(b *testing.B, encfn benchFn, decfn benchFn) {
 	benchBs = benchBs[0:0]
 	buf := bytes.NewBuffer(benchBs)
 	if err = encfn(buf, &benchTs); err != nil {
-		lf(b, "Error encoding benchTs: %v", err)
+		logT(b, "Error encoding benchTs: %v", err)
 		b.FailNow()
 	}
 	encLen := buf.Len()
@@ -142,23 +139,23 @@ func fnBenchmarkDecode(b *testing.B, encfn benchFn, decfn benchFn) {
 		ts := new(TestStruc)		
 		buf = bytes.NewBuffer(benchBs)
 		if err = decfn(buf, ts); err != nil {
-			lf(b, "Error decoding into new TestStruc: %v", err)
+			logT(b, "Error decoding into new TestStruc: %v", err)
 			b.FailNow()
 		}
 		if ts.I64slice[2] != int64(3) {
-			lf(b, "Error: Decode failed by checking values")
+			logT(b, "Error: Decode failed by checking values")
 			b.FailNow()
 		}
 	}
 }
 
 func fnMsgpackEncodeFn(buf *bytes.Buffer, ts *TestStruc) error {
-	return NewEncoder(buf, &EncoderOptions{USEC}).Encode(ts)
+	return NewEncoder(buf).Encode(ts)
 }
 
 func fnMsgpackDecodeFn(buf *bytes.Buffer, ts *TestStruc) error {
 	//return NewDecoder(buf, nil).Decode(ts)
-	return NewDecoder(buf, &DecoderOptions{nil, nil, false, false, false, USEC}).Decode(ts)
+	return NewDecoder(buf, testDecOpts(nil, nil, false, false, false)).Decode(ts)
 }
 
 func fnGobEncodeFn(buf *bytes.Buffer, ts *TestStruc) error {

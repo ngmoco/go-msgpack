@@ -43,47 +43,64 @@ import (
 	"strings"
 	"fmt"
 	"time"
-	"errors"
+)
+
+type ContainerType byte
+
+const (
+	ContainerRawBytes = ContainerType('b')
+	ContainerList = ContainerType('a')
+	ContainerMap = ContainerType('m')
 )
 
 var (
-	raisePanicAfterRecover = false
-
 	structInfoFieldName = "_struct"
 	
 	cachedStructFieldInfos = make(map[reflect.Type]*structFieldInfos, 4)
 	cachedStructFieldInfosMutex sync.Mutex
 
-	byteSliceTyp = reflect.TypeOf([]byte(nil))
-	intfSliceTyp = reflect.TypeOf([]interface{}(nil))
+	nilIntfSlice = []interface{}(nil)
+	intfSliceTyp = reflect.TypeOf(nilIntfSlice)
 	intfTyp = intfSliceTyp.Elem()
+	byteSliceTyp = reflect.TypeOf([]byte(nil))
 	timeTyp = reflect.TypeOf(time.Time{})
 	mapStringIntfTyp = reflect.TypeOf(map[string]interface{}(nil))
 	mapIntfIntfTyp = reflect.TypeOf(map[interface{}]interface{}(nil))
 )
 
 type structFieldInfo struct {
-	i         int // field index in struct
+	i         int      // field index in struct
+	is        []int
 	tag       string
 	omitEmpty bool
-	skip      bool
-	encName   string // encode name
-	name      string // field name
+	encName   string   // encode name
+	encNameBs []byte
+	name      string   // field name
 }
 
 type structFieldInfos struct {
 	sis []*structFieldInfo
+	//do not use a map for encName:SI, since number of keys is small.
 	//encmap map[string]*structFieldInfo
 }
 
-func (sis *structFieldInfos) getForEncName(name string) *structFieldInfo {
-	for _, si := range sis.sis {
+func (si *structFieldInfo) field(struc reflect.Value) (rv reflect.Value) {
+	if si.i == -1 {
+		rv = struc.FieldByIndex(si.is)
+	} else {
+		rv = struc.Field(si.i)
+	}
+	return
+}
+
+func (sis *structFieldInfos) getForEncName(name string) (si *structFieldInfo) {
+	for _, si = range sis.sis {
 		if si.encName == name {
-			return si
+			return
 		}
 	}
-	return nil
-	//return sis.encmap[name]
+	si = nil
+	return
 }
 
 func getStructFieldInfos(rt reflect.Type) (sis *structFieldInfos) {
@@ -96,76 +113,108 @@ func getStructFieldInfos(rt reflect.Type) (sis *structFieldInfos) {
 	defer cachedStructFieldInfosMutex.Unlock()
 	
 	sis = new(structFieldInfos)
-		
-	var si, siInfo *structFieldInfo
+	
+	var siInfo *structFieldInfo
 	if f, ok := rt.FieldByName(structInfoFieldName); ok {
-		siInfo = parseStructFieldInfo(f)
-		//fmt.Printf("siInfo.tag: %v, siInfo.omitEmpty: %v\n", siInfo.tag, siInfo.omitEmpty)
+		siInfo = parseStructFieldInfo(structInfoFieldName, f.Tag.Get("msgpack"))
 	}
+	rgetStructFieldInfos(rt, nil, sis, siInfo)
+	cachedStructFieldInfos[rt] = sis
+	return
+}
+
+func rgetStructFieldInfos(rt reflect.Type, indexstack []int, sis *structFieldInfos, siInfo *structFieldInfo) {
 	for j := 0; j < rt.NumField(); j++ {
 		f := rt.Field(j)
-		si = parseStructFieldInfo(f)
-		if si.skip {
+		stag := f.Tag.Get("msgpack")
+		if stag == "-" {
 			continue
 		}
+
+		if r1, _ := utf8.DecodeRuneInString(f.Name); r1 == utf8.RuneError || !unicode.IsUpper(r1) {
+			continue
+		} 
+
+		if f.Anonymous {
+			//if anonymous, inline it if there is no msgpack tag, else treat as regular field
+			if stag == "" {
+				rgetStructFieldInfos(f.Type, append2Is(indexstack, j), sis, siInfo)
+				continue
+			}
+		}
+		si := parseStructFieldInfo(f.Name, stag)
+		
+		if len(indexstack) == 0 {
+			si.i = j
+		} else {
+			si.i = -1
+			si.is = append2Is(indexstack, j)
+		}
+
 		if siInfo != nil {
 			if siInfo.omitEmpty {
 				si.omitEmpty = true
 			}
 		}
 		sis.sis = append(sis.sis, si)
-		//if sis.encmap == nil {
-		//	sis.encmap = make(map[string]*structFieldInfo, rt.NumField())
-		//}
-		//sis.encmap[si.encName] = si
 	}
-	cachedStructFieldInfos[rt] = sis
+}
+
+func append2Is(indexstack []int, j int) (indexstack2 []int) {
+	// istack2 := indexstack //make copy (not sufficient ... since it'd still share array)
+	indexstack2 = make([]int, len(indexstack)+1)
+	copy(indexstack2, indexstack)
+	indexstack2[len(indexstack2)-1] = j
 	return
 }
 
-func parseStructFieldInfo(f reflect.StructField) (si *structFieldInfo) {
-	si = &structFieldInfo{
-		i: f.Index[0],
-		name: f.Name,
-		encName: f.Name,
+func parseStructFieldInfo(fname string, stag string) (si *structFieldInfo) {
+	if fname == "" {
+		panic("parseStructFieldInfo: No Field Name")
 	}
+	si = &structFieldInfo {
+		name: fname,
+		encName: fname,
+		tag: stag,
+	}	
 	
-	//TODO: Skip anonymous fields for now, until JSON, etc decide what to do with them
-	if f.Anonymous {
-		si.skip = true
-	} else {
-		rune1, _ := utf8.DecodeRuneInString(si.name)
-		if rune1 == utf8.RuneError || !unicode.IsUpper(rune1) {
-			si.skip = true
-		} 
-	}
-	
-	si.tag = f.Tag.Get("msgpack")
-	switch si.tag {
-	case "":
-	case "-":
-		si.skip = true
-	default:
+	if stag != "" {
 		for i, s := range strings.Split(si.tag, ",") {
 			if i == 0 {
 				if s != "" {
 					si.encName = s
 				}
-				continue
-			}
-			switch s {
-			case "omitempty":
-				si.omitEmpty = true
+			} else {
+				if s == "omitempty" {
+					si.omitEmpty = true
+				}
 			}
 		}
+	}
+	si.encNameBs = []byte(si.encName)
+	return
+}
+
+func getContainerByteDesc(ct ContainerType) (cutoff int, b0, b1, b2 byte) {
+	switch ct {
+	case ContainerRawBytes:
+		cutoff = 32
+		b0, b1, b2 = 0xa0, 0xda, 0xdb
+	case ContainerList:
+		cutoff = 16
+		b0, b1, b2 = 0x90, 0xdc, 0xdd
+	case ContainerMap:
+		cutoff = 16
+		b0, b1, b2 = 0x80, 0xde, 0xdf
+	default:
+		panic(fmt.Errorf("getContainerByteDesc: Unknown container type: %v", ct))
 	}
 	return
 }
 
 func reflectValue(v interface{}) (rv reflect.Value) {
-	if rv2, ok := v.(reflect.Value); ok {
-		rv = rv2
-	} else {
+	rv, ok := v.(reflect.Value)
+	if !ok {
 		rv = reflect.ValueOf(v)
 	}
 	return 
@@ -174,76 +223,13 @@ func reflectValue(v interface{}) (rv reflect.Value) {
 func panicToErr(err *error) {
 	if x := recover(); x != nil { 
 		panicToErrT(x, err)
-		if raisePanicAfterRecover {
-			panic(x)
-		}
 	}
 }
 
-func panicToErrT(panicVal interface{}, err *error) {
-	switch xerr := panicVal.(type) {
-	case error:
-		*err = xerr
-	case string:
-		*err = errors.New(xerr)
-	default:
-		*err = fmt.Errorf("%v", panicVal)
-	}
-	//panic(panicVal)
-	return
-}
-
-func isEmptyValue(v reflect.Value) bool {
-	switch v.Kind() {
-	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
-		return v.Len() == 0
-	case reflect.Bool:
-		return !v.Bool()
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return v.Int() == 0
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		return v.Uint() == 0
-	case reflect.Float32, reflect.Float64:
-		return v.Float() == 0
-	case reflect.Interface, reflect.Ptr:
-		return v.IsNil()
-	}
-	return false
-}
-
-func approxDataSize(rv reflect.Value, inclContainerSize bool, inclNonDataSize bool) (sum int) {
-	if !rv.IsValid() {
-		return
-	}
-	switch rk := rv.Kind(); rk {
-	case reflect.Invalid:
-	case reflect.Chan, reflect.Func, reflect.UnsafePointer:
-		if inclNonDataSize { sum += int(rv.Type().Size()) }
-	case reflect.Ptr, reflect.Interface:
-		if inclNonDataSize { sum += int(rv.Type().Size()) }
-		sum += approxDataSize(rv.Elem(), inclContainerSize, inclNonDataSize)
-    case reflect.Array, reflect.Slice:
-		if inclContainerSize { sum += int(rv.Type().Size()) }
-		for j := 0; j < rv.Len(); j++ {
-			sum += approxDataSize(rv.Index(j), inclContainerSize, inclNonDataSize)
-		}
-    case reflect.String:
-		if inclContainerSize { sum += int(rv.Type().Size()) }
-		sum += rv.Len()
-    case reflect.Map:
-		if inclContainerSize { sum += int(rv.Type().Size()) }
-		for _, mk := range rv.MapKeys() {
-			sum += approxDataSize(mk, inclContainerSize, inclNonDataSize)
-			sum += approxDataSize(rv.MapIndex(mk), inclContainerSize, inclNonDataSize)
-		}
-    case reflect.Struct:
-		if inclContainerSize { sum += int(rv.Type().Size()) }
-		for j := 0; j < rv.NumField(); j++ {
-			sum += approxDataSize(rv.Field(j), inclContainerSize, inclNonDataSize)
-		}		
-	default:
-		sum += int(rv.Type().Size())
-	}
-	return
+func doPanic(tag string, format string, params []interface{}) {
+	params2 := make([]interface{}, len(params) + 1)
+	params2[0] = tag
+	copy(params2[1:], params)
+	panic(fmt.Errorf("%s: " + format, params2...))
 }
 
