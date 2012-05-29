@@ -30,7 +30,7 @@ Usage
   
   //RPC Communication
   conn, err = net.Dial("tcp", "localhost:5555")
-  rpcCodec := msgpack.NewRPCCodec(conn, nil, true)
+  rpcCodec := msgpack.NewRPCCodec(msgpack.BasicRPC, conn, nil)
   client := rpc.NewClientWithCodec(rpcCodec)
  
 */
