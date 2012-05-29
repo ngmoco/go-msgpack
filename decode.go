@@ -505,7 +505,7 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool,
 		
 		for j := 0; j < containerLen; j++ {
 			rvj := rv.Index(j)
-			if rvelemtype == intfTyp {
+			if rvelemtype == intfTyp && rvj.IsNil() {
 				rvj, bd0, ct0, containerLen0, handled0 := d.nilIntfDecode(0, -1, true, false, rvj)
 				// fmt.Printf("intfTyp: %v, %v, %v, %v, %v\n", rvj.Interface(), bd0, ct0, containerLen0, handled0)
 				if !handled0 {
@@ -570,7 +570,7 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool,
 			if !rvv.IsValid() {
 				rvv = reflect.New(vtype).Elem()
 			}
-			if vtype == intfTyp {
+			if vtype == intfTyp && rvv.IsNil() {
 				rvv, bd0, ct0, containerLen0, handled0 := d.nilIntfDecode(0, -1, true, false, rvv)
 				if !handled0 {
 					if rvv2 := d.dam.DecoderContainer(rv, rvk, containerLen0, ct0); rvv2.IsValid() {

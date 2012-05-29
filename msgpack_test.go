@@ -401,6 +401,41 @@ func TestDecodePtr(t *testing.T) {
 	}
 }
 
+func TestIntfDecode(t *testing.T) {
+	m := map[string]int{"A":2, "B":3, }
+	p := []interface{}{m}
+	bs, err := Marshal(p)
+	if err != nil {
+		logT(t, "Error marshalling p: %v, Err: %v", p, err)
+		t.FailNow()
+	}
+	m2 := map[string]int{}
+	p2 := []interface{}{m2}
+    err = Unmarshal(bs, &p2, nil)
+	if err != nil {
+		logT(t, "Error unmarshalling into &p2: %v, Err: %v", p2, err)
+		t.FailNow()
+	}
+	
+	if m2["A"] != 2 || m2["B"] != 3 {
+		logT(t, "m2 not as expected: expecting: %v, got: %v", m, m2)
+		t.FailNow()
+	}
+	// log("m: %v, m2: %v, p: %v, p2: %v", m, m2, p, p2)
+	if reflect.DeepEqual(p, p2) {
+		logT(t, "p and p2 match")
+	} else {
+		logT(t, "Not Equal: p: %v, p2: %v", p, p2)
+		t.FailNow()
+	}
+	if reflect.DeepEqual(m, m2) {
+		logT(t, "m and m2 match")
+	} else {
+		logT(t, "Not Equal: m: %v, m2: %v", m, m2)
+		t.FailNow()
+	}
+}
+
 // Test that we honor the rpc.ClientCodec and rpc.ServerCodec
 func TestRpcInterface(t *testing.T) {
 	c := new(rpcCodec)
