@@ -30,12 +30,19 @@ package msgpack
 
 import (
 	"net"
-	"sync"
 	"sync/atomic"
 	"log"
 	"errors"
 	"reflect"
+	"time"
 )
+
+// If not set in a constructor, this will limit the number of
+// "in-flight" requests that will be processed before blocking
+// For single connections, thes should be set high to avoid blocking.
+// When pooling clients, a lower limit may be desireable to limit the
+// number of requests that will fail when an error occurs.
+const DefaultFlightLimitSize = 100
 
 /* The Client class reimplements the RPC protocol but adds pipelining support
  * which is not supported by the net/rpc general RPC impelementation
@@ -45,13 +52,17 @@ type Client struct {
 	dec *Decoder
 	enc *Encoder
 	msgid uint32
-	seqMutex sync.Mutex
 	sendChan chan []interface{}
 	replyCheckChan chan replyCheck
 	replyChanInternal chan ClientResponse
 	dieChan chan error
+	flightLimit chan int
+	graceful int32
 	closed int32
 	cce *ClientClosedError
+	// graceful shutdown
+	doneChan chan int
+	doneTimeout time.Duration
 }
 
 type ClientResponse struct {
@@ -70,20 +81,25 @@ func NewClient(conn net.Conn, dopts *DecoderOptions, eopts *EncoderOptions) (*Cl
 }
 
 func NewClientWithOptions(conn net.Conn, dopts *DecoderOptions, eopts *EncoderOptions) (*Client) {
+	return NewClientWithOptionsAndFlightLimit(conn, dopts, eopts, DefaultFlightLimitSize)
+}
+
+func NewClientWithOptionsAndFlightLimit(conn net.Conn, dopts *DecoderOptions, eopts *EncoderOptions, inFlight int) (*Client) {
 	c := &Client{
 		conn: conn,
 		dec: NewDecoder(conn, dopts),
 		enc: NewEncoder(conn, eopts),
 		msgid: 1,
-		sendChan: make(chan []interface{}, 100),
+		sendChan: make(chan []interface{}), // the network buffer is going to buffer a bunch of requests so use the inflight limit
 		// unbuffered to make sure we have it on the reply side before we send the message
 		replyCheckChan: make(chan replyCheck),
-		replyChanInternal: make(chan ClientResponse, 100),
+		replyChanInternal: make(chan ClientResponse, inFlight),
 		dieChan: make(chan error, 3), // I want to make sure that both send and recieve don't block and exit their loops
+		flightLimit: make(chan int, inFlight),
 	}
 	go c.receiver()
 	go c.sender()
-	return c
+	return c	
 }
 
 // Send a request and wait for a response
@@ -132,21 +148,23 @@ func (c *Client) SendAsync(method string, params []interface{}, replyChan chan C
 	return msgid, nil
 }
 
+func (c *Client) Closed() *ClientClosedError {
+	if c.closed == 1 {
+		return c.cce
+	}
+	return nil
+}
+
 // Grab the next sequence atomically to allow multiple
 // goroutines to call a single client
 func (c *Client) nextSequence() uint32 {
 	// grab a sequence atomically
-	c.seqMutex.Lock()
-	tmp := c.msgid
-	c.msgid++
-	c.seqMutex.Unlock()
-	return tmp
+	return atomic.AddUint32(&c.msgid, 1)
 }
 
 // sends on the socket and doesn't care about responses
 func (c *Client) sender() {
 	for req := range c.sendChan {
-		log.Println("Got request to send")
 		if c.closed == 1 {
 			break
 		}
@@ -155,6 +173,9 @@ func (c *Client) sender() {
 			c.dieChan <- err
 			break
 		}
+		// this is just a fence which will be locked by the 
+		// receive when the wait hits the threshold
+		c.flightLimit <- 1
 	}
 	log.Println("RPC client socket writer shutting down")
 }
@@ -163,12 +184,11 @@ func (c *Client) receiver() {
 	// holds a map of message ID's to their response channels
 	replyMap := make(map[uint32]chan ClientResponse)
 	first := true
-	for c.closed != 1 {
+	for c.closed != 1 || c.graceful == 1 {
 		select {
 		case replyCheck := <- c.replyCheckChan:
 			// TODO: check map for lost messages (timed-out) and return errors
 			replyMap[replyCheck.msgid] = replyCheck.replyChan
-
 			// when I get the first reqest, start the socket receiver go routine
 			if first {
 				first = false
@@ -185,23 +205,56 @@ func (c *Client) receiver() {
 					log.Printf("Discarded message %v on busy channel", reply.Msgid)
 				}
 			}
+			// decrement in in flight... this should never block since it will be increment in the sender before it gets here
+			<- c.flightLimit
 		case err := <- c.dieChan:
-			log.Println("Got a fatal error:", err)
+			log.Println("RPC Client shutting down:", err)
 			// shutdown everything and clear the rest of the responses with an error
 			// this stops the senders
 			c.cce = &ClientClosedError{err}
-			c.Close()
-			// this should break the IO loops if not already broken
-			c.conn.Close()
+			atomic.StoreInt32(&c.closed, 1)
+			
+			if c.graceful != 1 {
+				// this should break the IO loops if not already broken
+				c.conn.Close()
+			} else {
+				// death clock
+				time.AfterFunc(c.doneTimeout, func(){
+					left := len(replyMap)
+					c.conn.Close()
+					atomic.StoreInt32(&c.graceful, -int32(left))
+				})
+			}
 			// sleep?
+		}
+		if c.graceful == 1 {
+			if len(replyMap) == 0 {
+				c.conn.Close()
+				atomic.StoreInt32(&c.graceful, 0)
+				break
+			}
 		}
 	}
 	c.cleanup(replyMap)
+	if c.doneChan != nil {
+		select {
+		case c.doneChan <- -int(c.graceful):
+		default:
+		}
+	}
 	log.Println("RPC Client closed to requests")
 }
 
+func (c *Client) ShutdownGracefully(timeout time.Duration, done chan int) {
+	// return the # of outstanding requests that were still around at close
+	atomic.StoreInt32(&c.graceful, 1)
+	c.doneChan = done
+	c.doneTimeout = timeout
+	c.Close()
+}
+
 func (c *Client) Close() {
-	atomic.StoreInt32(&c.closed, 1)
+	c.dieChan <- errors.New("Close requested")
 }
 
 func (c *Client) cleanup(replyMap map[uint32]chan ClientResponse) {
@@ -270,7 +323,7 @@ func (c *Client) cleanup(replyMap map[uint32]chan ClientResponse) {
 
 // this is only to listen to the recieve side of the socket
 func (c *Client) connRecv() {
-	for c.closed != 1 {
+	for c.closed != 1 || c.graceful == 1{
 		var v interface{}
 		err := c.dec.Decode(&v)
 		if err != nil {
