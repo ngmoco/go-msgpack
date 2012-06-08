@@ -32,20 +32,37 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 package msgpack
 
+// All non-std package dependencies live in this file,
+// so porting to different environment is easy (just update functions).
+
 import (
 	"testing"
+	"reflect"
 	"fmt"
 	"errors"
-	"reflect"
 )
 
 var (
-	raisePanicAfterRecover = false 
+	raisePanicAfterRecover = false
 	showLog = true
 	debugging = false
 	testLogToT = true
-	failNowOnFail = false
+	failNowOnFail = true
 )
+
+func checkErrT(t *testing.T, err error) {
+	if err != nil {
+		logT(t, err.Error())
+		failT(t)
+	}
+}
+
+func checkEqualT(t *testing.T, v1 interface{}, v2 interface{}) {
+	if !reflect.DeepEqual(v1, v2) { 
+		logT(t, "Do not match: v1: %v, v2: %v", v1, v2)
+		failT(t)
+	}
+}
 
 func panicToErrT(panicVal interface{}, err *error) {
 	switch xerr := panicVal.(type) {
@@ -61,34 +78,6 @@ func panicToErrT(panicVal interface{}, err *error) {
 	}
 	return
 }
-
-func logT(x interface{}, format string, args ...interface{}) {
-	if t, ok := x.(*testing.T); ok && t != nil && testLogToT {
-		t.Logf(format, args...)	
-	} else if b, ok := x.(*testing.B); ok && b != nil && testLogToT {
-		b.Logf(format, args...)
-	} else {
-		log(format, args...)
-	}
-}
-
-func failT(t *testing.T) {
-	if failNowOnFail {
-		t.FailNow()
-	} else {
-		t.Fail()
-	}
-}
-
-func log(format string, args ...interface{}) {
-	if showLog || debugging {
-		if len(format) == 0 || format[len(format)-1] != '\n' {
-			format = format + "\n"
-		}
-		fmt.Printf(format, args...)
-	}
-}
-
 
 func isEmptyValue(v reflect.Value) bool {
 	switch v.Kind() {
@@ -139,5 +128,32 @@ func approxDataSize(rv reflect.Value) (sum int) {
 		sum += int(rv.Type().Size())
 	}
 	return
+}
+
+func logT(x interface{}, format string, args ...interface{}) {
+	if t, ok := x.(*testing.T); ok && t != nil && testLogToT {
+		t.Logf(format, args...)	
+	} else if b, ok := x.(*testing.B); ok && b != nil && testLogToT {
+		b.Logf(format, args...)
+	} else {
+		log(format, args...)
+	}
+}
+
+func failT(t *testing.T) {
+	if failNowOnFail {
+		t.FailNow()
+	} else {
+		t.Fail()
+	}
+}
+
+func log(format string, args ...interface{}) {
+	if showLog || debugging {
+		if len(format) == 0 || format[len(format)-1] != '\n' {
+			format = format + "\n"
+		}
+		fmt.Printf(format, args...)
+	}
 }
 

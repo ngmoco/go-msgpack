@@ -58,6 +58,7 @@ import (
 	"io/ioutil"
 	"path/filepath"
 	"strconv"
+	"net"
 )
 
 var (
@@ -70,6 +71,7 @@ var (
 	tableTestNilVerify []interface{}  // for nil interface, use this to verify (rules are different)
 	tablePythonVerify []interface{}   // for verifying for python, since Python sometimes
                                       // will encode a float32 as float64, or large int as uint
+	testRpcInt = new(TestRpcInt)
 )
 
 type AnonInTestStruc struct {
@@ -115,8 +117,16 @@ type TestStruc struct {
 	Nteststruc *TestStruc
 }
 
+type TestRpcInt struct {
+	i int
+}
+
+func (r *TestRpcInt) Update(n int, res *int) error { r.i = n; *res = r.i; return nil }
+func (r *TestRpcInt) Square(ignore int, res *int) error { *res = r.i * r.i; return nil }
+func (r *TestRpcInt) Mult(n int, res *int) error { *res = r.i * n; return nil }
+
 func init() {
-	primitives := []interface{}{
+	primitives := []interface{} {
 		int8(-8),
 		int16(-1616),
 		int32(-32323232),
@@ -289,7 +299,6 @@ func doTestMsgpacks(t *testing.T, testNil bool, opts DecoderContainerResolver, /
 	vs []interface{}, vsVerify []interface{}) {
 	//if testNil, then just test for when a pointer to a nil interface{} is passed. It should work.
 	//Current setup allows us test (at least manually) the nil interface or typed interface.
-	//logT(t, "$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$*$\n")
 	logT(t, "================ TestNil: %v ================\n", testNil)
 	for i, v0 := range vs {
 		logT(t, "..............................................")
@@ -321,7 +330,6 @@ func doTestMsgpacks(t *testing.T, testNil bool, opts DecoderContainerResolver, /
 			//we always indirect, because ptr to typed value may be passed (if not testNil)
 			v1 = reflect.Indirect(reflect.ValueOf(v1)).Interface()
 		}
-		//v1 = indirIntf(v1, nil, -1)
 		if err != nil {
 			logT(t, "-------- Error: %v. Partial return: %v", err, v1)
 			failT(t)
@@ -436,15 +444,112 @@ func TestIntfDecode(t *testing.T) {
 	}
 }
 
-// Test that we honor the rpc.ClientCodec and rpc.ServerCodec
-func TestRpcInterface(t *testing.T) {
-	c := new(rpcCodec)
-	_ = func() { c.Close() }
-	//f, _ := os.Open("some-random-file-jkjkjfkldlsfalkdljflsjljad")
-	//c = NewRPCCodec(f)
-	//c.Close()
-	var _ rpc.ClientCodec = c
-	var _ rpc.ServerCodec = c
+// comment out for now
+func TestRpcAll(t *testing.T) {
+	testRpc(t, true, true, true, true)
+}
+
+func TestRpc(t *testing.T) {
+	testRpc(t, true, true, false, true)
+}
+
+func TestCustomRpc(t *testing.T) {
+	testRpc(t, true, false, true, true)
+}
+
+func testRpc(t *testing.T, callClose, doBasic, doCustom, doExit bool) {
+	srv := rpc.NewServer()
+	srv.Register(testRpcInt)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// log("listener: %v", ln.Addr())
+	checkErrT(t, err)
+	defer ln.Close()
+	
+	var opts DecoderContainerResolver
+	serverExitChan := make(chan bool, 1)
+	serverFn := func() {
+		for { 
+			conn1, err1 := ln.Accept()
+			if err1 != nil {
+				continue
+			}
+			bs := make([]byte, 1)
+			n1, err1 := conn1.Read(bs)
+			if n1 != 1 || err1 != nil {
+				conn1.Close()
+				continue
+			}
+			var sc rpc.ServerCodec
+			switch bs[0] {
+			case 'B': 
+				sc = NewRPCServerCodec(conn1, opts)
+			case 'C':
+				sc = NewCustomRPCServerCodec(conn1, opts)
+			case 'X':
+				serverExitChan <- true
+				conn1.Close()
+				return // exit serverFn goroutine
+			}
+			if sc == nil {
+				conn1.Close()
+				continue
+			}
+			srv.ServeCodec(sc)
+			// for {
+			// 	if err1 = srv.ServeRequest(sc); err1 != nil {
+			// 		break
+			// 	}
+			// }
+			// if callClose {
+			// 	sc.Close() 
+			// }
+		}
+	}
+	
+	clientFn := func(cc rpc.ClientCodec) {
+		cl := rpc.NewClientWithCodec(cc)
+		if callClose {
+			defer cl.Close() 
+		} 
+		var up, sq, mult int
+		// log("Calling client")
+		checkErrT(t, cl.Call("TestRpcInt.Update", 5, &up))
+		// log("Called TestRpcInt.Update")
+		checkEqualT(t, testRpcInt.i, 5)
+		checkEqualT(t, up, 5)
+		checkErrT(t, cl.Call("TestRpcInt.Square", 1, &sq))
+		checkEqualT(t, sq, 25)
+		checkErrT(t, cl.Call("TestRpcInt.Mult", 20, &mult))
+		checkEqualT(t, mult, 100)		
+	}
+	
+	connFn := func(req byte) (bs net.Conn) {
+		// log("calling f1")
+		bs, err2 := net.Dial(ln.Addr().Network(), ln.Addr().String())
+		// log("f1. bs: %v, err2: %v", bs, err2)
+		checkErrT(t, err2)
+		n1, err2 := bs.Write([]byte{req})
+		checkErrT(t, err2)
+		checkEqualT(t, n1, 1)
+		return
+	}
+	
+	go serverFn()
+	if doBasic {
+		bs := connFn('B')
+		cc := NewRPCClientCodec(bs, opts)
+		clientFn(cc)
+	}
+	if doCustom {
+		bs := connFn('C')
+		cc := NewCustomRPCClientCodec(bs, opts)
+		clientFn(cc)
+	}
+	if doExit {
+		bs := connFn('X')
+		<- serverExitChan
+		bs.Close()
+	}
 }
 
 // Comprehensive testing that generates data encoded from python msgpack, 

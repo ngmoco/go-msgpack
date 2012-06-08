@@ -128,9 +128,24 @@ func (e *Encoder) encodeValue(rv reflect.Value) {
 	// Tested with a type assertion for all common types first, but this increased encoding time
 	// sometimes by up to 20% (weird). So just use the reflect.Kind switch alone.
 	
+	// ensure more common cases appear early in switch.
 	switch rk := rv.Kind(); rk {
-	case reflect.Invalid:
-		e.encNil()
+	case reflect.Bool:
+		e.encBool(rv.Bool())
+	case reflect.String:
+		e.encString(rv.String())
+	case reflect.Int, reflect.Int8, reflect.Int64, reflect.Int32, reflect.Int16:
+		e.encInt(rv.Int())
+	case reflect.Uint8, reflect.Uint64, reflect.Uint, reflect.Uint32, reflect.Uint16:
+		e.encUint(rv.Uint())
+	case reflect.Float64:
+		e.t9[0] = 0xcb
+		binary.BigEndian.PutUint64(e.t91, math.Float64bits(rv.Float()))
+		e.writeb(9, e.t9)
+	case reflect.Float32:
+		e.t5[0] = 0xca
+		binary.BigEndian.PutUint32(e.t51, math.Float32bits(float32(rv.Float())))
+		e.writeb(5, e.t5)
 	case reflect.Slice:
 		if rv.IsNil() {
 			e.encNil()
@@ -185,28 +200,14 @@ func (e *Encoder) encodeValue(rv reflect.Value) {
 			break
 		}
 		e.encodeStruct(rt, rv)
-	case reflect.Bool:
-		e.encBool(rv.Bool())
-	case reflect.Float32:
-		e.t5[0] = 0xca
-		binary.BigEndian.PutUint32(e.t51, math.Float32bits(float32(rv.Float())))
-		e.writeb(5, e.t5)
-	case reflect.Float64:
-		e.t9[0] = 0xcb
-		binary.BigEndian.PutUint64(e.t91, math.Float64bits(rv.Float()))
-		e.writeb(9, e.t9)
-	case reflect.String:
-		e.encString(rv.String())
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		e.encInt(rv.Int())
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		e.encUint(rv.Uint())
 	case reflect.Ptr, reflect.Interface:
 		if rv.IsNil() {
 			e.encNil()
 			break
 		}
 		e.encodeValue(rv.Elem())
+	case reflect.Invalid:
+		e.encNil()
 	default:
 		e.err("Unsupported kind: %s, for: %#v", rk, rv)
 	}
@@ -340,7 +341,12 @@ func (e *Encoder) writeb(numbytes int, bs []byte) {
 	// no sanity checking. Assume callers pass valid arguments. It's pkg-private: we can control it.
 	n, err := e.w.Write(bs)
 	if err != nil {
-		e.err("Error: %v", err)
+		// propagage io.EOF upwards (it's special, and must be returned AS IS)
+		if err == io.EOF {
+			panic(err)
+		} else {
+			e.err("Error: %v", err)
+		}
 	}
 	if n != numbytes {
 		e.err("write: Incorrect num bytes written. Expecting: %v, Wrote: %v", numbytes, n)

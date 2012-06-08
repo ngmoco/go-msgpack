@@ -54,7 +54,9 @@ import (
 	"reflect"
 	"math"
 	"fmt"
+	// "net"
 	"time"
+	// "runtime/debug"
 	"encoding/binary"
 )
 
@@ -106,15 +108,6 @@ type DecoderContainerResolver interface {
 	// (see SimpleDecoderContainerResolver).
 	DecoderContainer(parentcontainer reflect.Value, parentkey interface{}, 
 		length int, ct ContainerType) (val reflect.Value)
-}
-
-// DecoderContainerResolverFunc exposes a function as a DecoderContainerResolver
-type DecoderContainerResolverFunc func(parentcontainer reflect.Value, parentkey interface{}, 
-	length int, ct ContainerType) (val reflect.Value)
-
-func (d DecoderContainerResolverFunc) DecoderContainer(
-	parentcontainer reflect.Value, parentkey interface{}, length int, ct ContainerType) (val reflect.Value) {
-	return d(parentcontainer, parentkey, length, ct)
 }
 
 // SimpleDecoderContainerResolver is a simple DecoderContainerResolver
@@ -234,8 +227,12 @@ func (d *Decoder) DecodeValue(rv reflect.Value) (err error) {
 	// We cannot marshal into a non-pointer or a nil pointer 
 	// (at least pass a nil interface so we can marshal into it)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		var rvi interface{} = rv
+		if rv.IsValid() && rv.CanInterface() {
+			rvi = rv.Interface()
+		}
 		err = fmt.Errorf("%v: DecodeValue: Expecting valid pointer to decode into. Got: %v, %T, %v",
-			msgTagDec, rv.Kind(), rv.Interface(), rv.Interface())
+			msgTagDec, rv.Kind(), rvi, rvi)
 		return
 	}
 
@@ -338,8 +335,8 @@ func (d *Decoder) nilIntfDecode(bd0 byte, containerLen0 int, readDesc bool, setC
 	return
 }
 
-func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool, 
-	rv0 reflect.Value) (wasNilIntf bool, rv reflect.Value) {
+func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool, rv0 reflect.Value) (
+	wasNilIntf bool, rv reflect.Value) {
 	//log(".. enter decode: rv: %v, %T, %v", rv0, rv0.Interface(), rv0.Interface())
 	//defer func() {
 	//	log("..  exit decode: rv: %v, %T, %v", rv, rv.Interface(), rv.Interface())
@@ -371,18 +368,10 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool,
 		return
 	}
 	
+	// cases are arranged in sequence of most probable ones
 	switch rk {
-	case reflect.Ptr, reflect.Interface:
-		rvelem := rv.Elem()
-		if rv.IsNil() {
-			rv.Set(reflect.New(rv.Type().Elem()))
-			rvelem = rv.Elem()
-		}
-		d.decodeValue(bd, containerLen, false, rvelem)
-	case reflect.Bool,
-		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
-		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
-		reflect.Float32, reflect.Float64:
+	default:
+		// handles numeral and bool values
 		switch bd {
 		case 0xc2:
 			rv.SetBool(false)
@@ -416,13 +405,13 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool,
 			//may be a single-byte integer
 			defHandled := false
 			switch rk {
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			case reflect.Int, reflect.Int64, reflect.Int32, reflect.Int8, reflect.Int16:
 				// if sbd > -32 && sbd <= math.MaxInt8 {
 				if bd >= 0x00 && bd <= 0x7f || bd >= 0xe0 && bd <= 0xff {
 					rv.SetInt(int64(int8(bd)))
 					defHandled = true
 				}
-			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			case reflect.Uint8, reflect.Uint64, reflect.Uint, reflect.Uint32, reflect.Uint16:
 				// if bd <= math.MaxInt8 {
 				if bd >= 0x00 && bd <= 0x7f {
 					rv.SetUint(uint64(bd))
@@ -430,14 +419,22 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool,
 				}
 			}
 			if !defHandled {
-				d.err("DefNotHandled DecodeValue: %s: %x", msgBadDesc, bd)
+				d.err("Unhandled single-byte value: %s: %x", msgBadDesc, bd)
 			}
 		}
-	case reflect.Slice, reflect.Array, reflect.String:
+	case reflect.String:
+		if containerLen < 0 {
+			containerLen = d.readContainerLen(bd, false, ContainerRawBytes)
+		}
+		if containerLen == 0 {
+			break
+		}		
+		bs := make([]byte, containerLen)
+		d.readb(containerLen, bs)
+		rv.SetString(string(bs))
+	case reflect.Slice:
 		rvtype := rv.Type()
-		isString := rk == reflect.String
-		isByteSlice := rvtype == byteSliceTyp
-		rawbytes := isString || isByteSlice
+		rawbytes := rvtype == byteSliceTyp
 		
 		if containerLen < 0 {
 			if rawbytes {
@@ -451,75 +448,71 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool,
 		}
 		
 		if rawbytes {
-			var bs []byte
-			if isByteSlice {
-				bs = rv.Bytes()
-			}
-			if len(bs) < containerLen {
-				bs = make([]byte, containerLen)
-				if isByteSlice {
-					rv.Set(reflect.ValueOf(bs))
-				}
-			} else if len(bs) > containerLen {
+			var bs []byte= rv.Bytes()
+			rvlen := len(bs)
+			if rvlen == containerLen {
+			} else if rvlen > containerLen {
 				bs = bs[:containerLen]
+			} else {
+				bs = make([]byte, containerLen)
+				rv.Set(reflect.ValueOf(bs))
 			}
 			d.readb(containerLen, bs)
-			if isString {
-				rv.SetString(string(bs))
+			break
+		}
+		
+		if rv.IsNil() {
+			rv.Set(reflect.MakeSlice(rvtype, containerLen, containerLen))
+		} else {
+			rvlen := rv.Len()
+			if containerLen > rv.Cap() {
+				rv2 := reflect.MakeSlice(rvtype, containerLen, containerLen)
+				if rvlen > 0 {
+					reflect.Copy(rv2, rv)
+				}
+				rv.Set(rv2)
+			} else if containerLen > rvlen {
+				rv.SetLen(containerLen)
+			}
+		}		
+		d.decodeValuePostList(rv, containerLen, rvtype.Elem() == intfTyp)
+	case reflect.Array:
+		rvtype := rv.Type()
+		rvlen := rv.Len()
+		rawbytes := rvlen > 0 && rv.Index(0).Kind() == reflect.Uint8
+		
+		if containerLen < 0 {
+			if rawbytes {
+				containerLen = d.readContainerLen(bd, false, ContainerRawBytes)
+			} else {
+				containerLen = d.readContainerLen(bd, false, ContainerList)
+			} 
+		}
+		if containerLen == 0 {
+			break
+		}
+		
+		if rawbytes {
+			var bs []byte = rv.Slice(0, rvlen).Bytes()
+			if rvlen == containerLen {
+				d.readb(containerLen, bs)
+			} else if rvlen > containerLen {
+				d.readb(containerLen, bs[:containerLen])
+			} else {
+				d.err("Array len: %d must be >= container Len: %d", rvlen, containerLen)
 			} 
 			break
 		}
-		if isString {
-			d.err("Strings must be handled as raw bytes")
-		}
-		rvelemtype := rvtype.Elem()
-
-		rvlen := rv.Len()
-		switch rk {
-		case reflect.Array:
-			if rvlen < containerLen {
-				d.err("Array len: %d must be >= container Len: %d", rvlen, containerLen)
-			} else if rvlen > containerLen {
-				for j := containerLen; j < rvlen; j++ {
-					rv.Index(j).Set(reflect.Zero(rvelemtype))
-				}
-			}
-		case reflect.Slice:
-			switch {
-			case rv.IsNil():
-				rv.Set(reflect.MakeSlice(rvtype, containerLen, containerLen))
-			case containerLen > rvlen:
-			switch {
-				case containerLen > rv.Cap():
-					rv2 := reflect.MakeSlice(rvtype, containerLen, containerLen)
-					if rvlen > 0 {
-						reflect.Copy(rv2, rv)
-					}
-					rv.Set(rv2)
-				default:
-					rv.SetLen(containerLen)
-				}
-			}
-			rvlen = containerLen
-		}
 		
-		for j := 0; j < containerLen; j++ {
-			rvj := rv.Index(j)
-			if rvelemtype == intfTyp && rvj.IsNil() {
-				rvj, bd0, ct0, containerLen0, handled0 := d.nilIntfDecode(0, -1, true, false, rvj)
-				// fmt.Printf("intfTyp: %v, %v, %v, %v, %v\n", rvj.Interface(), bd0, ct0, containerLen0, handled0)
-				if !handled0 {
-					if rvj2 := d.dam.DecoderContainer(rv, j, containerLen0, ct0); rvj2.IsValid() {
-						rvj2 = d.decodeValueT(bd0, containerLen0, false, rvj2, false, true, false)
-						rvj.Set(rvj2)
-					} else {
-						d.decodeValueT(bd0, containerLen0, false, rvj, true, true, true)
-					}
-				}
-			} else {
-				d.decodeValueT(0, -1, true, rvj, true, true, true)
+		rvelemtype := rvtype.Elem()
+		if rvlen < containerLen {
+			d.err("Array len: %d must be >= container Len: %d", rvlen, containerLen)
+		} else if rvlen > containerLen {
+			for j := containerLen; j < rvlen; j++ {
+				rv.Index(j).Set(reflect.Zero(rvelemtype))
 			}
 		}
+		d.decodeValuePostList(rv, containerLen, rvelemtype == intfTyp)
 	case reflect.Struct:
 		rvtype := rv.Type()
 		if rvtype == timeTyp {
@@ -585,26 +578,49 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool,
 			}
 			rv.SetMapIndex(rvk, rvv)
 		}
+	case reflect.Ptr:
+		if rv.IsNil() {
+			rv.Set(reflect.New(rv.Type().Elem()))
+		}
+		d.decodeValue(bd, containerLen, false, rv.Elem())
+	case reflect.Interface:
+		d.decodeValue(bd, containerLen, false, rv.Elem())
 	}
 	return
 }
 
-// read a number of bytes into bs, and return an appropriate
-// []byte with length adjusted.
-func (d *Decoder) readb(numbytes int, bs []byte) {
-	n, err := d.r.Read(bs)
-	if err != nil {
-		d.err("Error: %v", err)
-	} else if n != numbytes {
-		//try to read one more time. This is necessary for example, if using a bufio.Reader,
-		//where at end of buffer, only a subset is returned, and remaining got next time.
-		n2, numbytes2 := 0, numbytes-n
-		n2, err = d.r.Read(bs[n:])
-		if err != nil {
-			d.err("Error: %v", err)
-		} else if n2 != numbytes2 {
-			d.err("read: Incorrect num bytes read. Expecting: %v, Received: %v", numbytes, n+n2)
+func (d *Decoder) decodeValuePostList(rv reflect.Value, containerLen int, elemIsIntf bool) {
+	for j := 0; j < containerLen; j++ {
+		rvj := rv.Index(j)
+		if elemIsIntf && rvj.IsNil() {
+			rvj, bd0, ct0, containerLen0, handled0 := d.nilIntfDecode(0, -1, true, false, rvj)
+			// fmt.Printf("intfTyp: %v, %v, %v, %v, %v\n", rvj.Interface(), bd0, ct0, containerLen0, handled0)
+			if !handled0 {
+				if rvj2 := d.dam.DecoderContainer(rv, j, containerLen0, ct0); rvj2.IsValid() {
+					rvj2 = d.decodeValueT(bd0, containerLen0, false, rvj2, false, true, false)
+					rvj.Set(rvj2)
+				} else {
+					d.decodeValueT(bd0, containerLen0, false, rvj, true, true, true)
+				}
+			}
+		} else {
+			d.decodeValueT(0, -1, true, rvj, true, true, true)
 		}
+	}
+}
+	
+// read a number of bytes into bs
+func (d *Decoder) readb(numbytes int, bs []byte) {
+	n, err := io.ReadAtLeast(d.r, bs, numbytes) 
+	if err != nil {
+		// propagage io.EOF upwards (it's special, and must be returned AS IS)
+		if err == io.EOF {
+			panic(err)
+		} else {
+			d.err("Error: %v", err)
+		}
+	} else if n != numbytes {
+		d.err("read: Incorrect num bytes read. Expecting: %v, Received: %v", numbytes, n)
 	}
 }
 

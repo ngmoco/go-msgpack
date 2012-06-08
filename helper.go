@@ -32,9 +32,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 package msgpack
 
-// All non-std package dependencies live in this file,
-// so porting to different environment is easy (just update functions).
-
 import (
 	"unicode"
 	"unicode/utf8"
@@ -80,19 +77,18 @@ type structFieldInfo struct {
 
 type structFieldInfos struct {
 	sis []*structFieldInfo
-	//do not use a map for encName:SI, since number of keys is small.
-	//encmap map[string]*structFieldInfo
 }
 
 func (si *structFieldInfo) field(struc reflect.Value) (rv reflect.Value) {
-	if si.i == -1 {
-		rv = struc.FieldByIndex(si.is)
-	} else {
+	if si.i > -1 {
 		rv = struc.Field(si.i)
+	} else {
+		rv = struc.FieldByIndex(si.is)
 	}
 	return
 }
 
+// linear search. faster than binary search in my testing up to 16-field structs.
 func (sis *structFieldInfos) getForEncName(name string) (si *structFieldInfo) {
 	for _, si = range sis.sis {
 		if si.encName == name {
@@ -104,8 +100,8 @@ func (sis *structFieldInfos) getForEncName(name string) (si *structFieldInfo) {
 }
 
 func getStructFieldInfos(rt reflect.Type) (sis *structFieldInfos) {
-	var ok bool
-	if sis, ok = cachedStructFieldInfos[rt]; ok {
+	sis, ok := cachedStructFieldInfos[rt]
+	if ok {
 		return 
 	}
 	

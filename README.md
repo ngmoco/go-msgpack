@@ -35,9 +35,14 @@ Usage
     data, err = msgpack.Marshal(v)  
     err = msgpack.Unmarshal(data, &v, nil)  
     
-    //RPC Communication  
+    //RPC Server
+    conn, err := listener.Accept()
+    rpcCodec := msgpack.NewRPCServerCodec(conn, nil)
+    rpc.ServeCodec(rpcCodec)
+
+    //RPC Communication (client side)
     conn, err = net.Dial("tcp", "localhost:5555")  
-    rpcCodec := msgpack.NewRPCCodec(conn, nil, true)  
+    rpcCodec := msgpack.NewRPCClientCodec(conn, nil)  
     client := rpc.NewClientWithCodec(rpcCodec)  
 
 </pre>

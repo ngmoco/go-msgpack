@@ -42,6 +42,7 @@ package msgpack
 
 import (
 	"fmt"
+	"strings"
 	"net/rpc"
 	"io"
 )
@@ -50,104 +51,155 @@ type rpcCodec struct {
 	rwc       io.ReadWriteCloser
 	dec       *Decoder
 	enc       *Encoder
-	fmt       rpcFormat
 }
 
-// rpcFormat determines the type of RPC serialization we use.
-// We use this instead of a boolean, so we can extend the set later without
-// breaking the published API.
-type rpcFormat byte
+type basicRpcCodec struct {
+	rpcCodec
+}
 
-const (
-	// BasicRPC format uses basic net/rpc serialization 
-	BasicRPC = rpcFormat('B')
-	// CustomRPC format uses custom format defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification .
-	// The custom format support allows us talk to msgpack-rpc compatible clients and servers.
-	CustomRPC = rpcFormat('C')
-)
+type customRpcCodec struct {
+	rpcCodec
+}
 
-var unknownRPCFmtErr = "Msgpack: Unknown RPC Format: %v"
-
-// NewRPCCodec returns a Codec which satisfies both rpc.ClientCodec and rpc.ServerCodec,
-// allowing us use msgpack serialization for rpc communication.
-// 
-// Sample Usage:
-//   conn, err = net.Dial("tcp", "localhost:5555")
-//   codec, err := msgpack.NewRPCCodec(msgpack.BasicRPC, conn, nil)
-//   // or either one below to be specific
-//   // var codec rpc.ClientCodec = msgpack.NewRPCCodec(...)
-//   // var codec rpc.ServerCodec = msgpack.NewRPCCodec(...)
-//   client := rpc.NewClientWithCodec(codec)
-//   ... (see rpc package for how to use an rpc client)
-func NewRPCCodec(rpcfmt rpcFormat, conn io.ReadWriteCloser, opts DecoderContainerResolver) (r *rpcCodec, err error) {
-	switch rpcfmt {
-	case BasicRPC, CustomRPC:
-	default:
-		err = fmt.Errorf(unknownRPCFmtErr, rpcfmt)
-		return
-	}
-	r = &rpcCodec{
+func newRPCCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpcCodec) {
+	return rpcCodec{
 		rwc: conn,
 		dec: NewDecoder(conn, opts),
 		enc: NewEncoder(conn),
-		fmt: rpcfmt,
+	}
+}
+
+// NewRPCClientCodec uses basic msgpack serialization for rpc communication from client side.
+// 
+// Sample Usage:
+//   conn, err = net.Dial("tcp", "localhost:5555")
+//   codec, err := msgpack.NewRPCClientCodec(conn, nil)
+//   client := rpc.NewClientWithCodec(codec)
+//   ... (see rpc package for how to use an rpc client)
+func NewRPCClientCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ClientCodec) {
+	return &basicRpcCodec{ newRPCCodec(conn, opts) }
+}
+
+// NewRPCServerCodec uses basic msgpack serialization for rpc communication from the server side.
+func NewRPCServerCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ServerCodec) {
+	return &basicRpcCodec{ newRPCCodec(conn, opts) }
+}
+
+// NewCustomRPCClientCodec uses msgpack serialization for rpc communication from client side, 
+// but uses a custom protocol defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification
+func NewCustomRPCClientCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ClientCodec) {
+	return &customRpcCodec{ newRPCCodec(conn, opts) }
+}
+	
+// NewCustomRPCServerCodec uses msgpack serialization for rpc communication from server side, 
+// but uses a custom protocol defined at http://wiki.msgpack.org/display/MSGPACK/RPC+specification
+func NewCustomRPCServerCodec(conn io.ReadWriteCloser, opts DecoderContainerResolver) (rpc.ServerCodec) {
+	return &customRpcCodec{ newRPCCodec(conn, opts) }
+}
+	
+// /////////////// RPC Codec Shared Methods ///////////////////
+func (c *rpcCodec) write(objs ...interface{}) (err error) {
+	for _, obj := range objs {
+		if err = c.enc.Encode(obj); err != nil {
+			return
+		}
 	}
 	return
 }
 
+func (c *rpcCodec) read(objs ...interface{}) (err error) {
+	for _, obj := range objs {
+		if err = c.dec.Decode(obj); err != nil {
+			return
+		}
+	}
+	return
+}
+
+// maybeEOF is used to possibly return EOF for functions (e.g. ReadXXXHeader) that
+// should return EOF if underlying connection was closed.
+// This is important because rpc uses goroutines on clients (to support sync and async models)
+// and on the server. Consequently, for calling Client.Close to work for example, the 
+// ReadRequestHeader and ReadResponseHeader methods should return EOF if underlying network 
+// connection was closed (e.g. by Client.Close). 
+// 
+// It's a best effort, as there's no general error returned for Using Closed Network Connection.
+func (c *rpcCodec) maybeEOF(err error) (errx error) {
+	if err == nil {
+		return nil
+	}
+	// defer func() { fmt.Printf("maybeEOF: orig: %T, %v, returning: %T, %v\n", err, err, errx, errx) }()
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		return io.EOF
+	} 
+	errstr := err.Error()
+	if strings.HasSuffix(errstr, "use of closed network connection") {
+		return io.EOF
+	}
+	// switch nerr := err.(type) {
+	// case *net.OpError:
+	// 	println(" ***** *net.OpError ***** ", nerr.Err.Error())
+	// 	if nerr.Err.Error() == "use of closed network connection" {
+	// 		return io.EOF
+	// 	}
+	// }
+	return err
+}
+
 func (c *rpcCodec) Close() error {
+	// fmt.Printf("Calling rpcCodec.Close: %v\n----------------------\n", string(debug.Stack()))
 	return c.rwc.Close()
-}
-
-func (c *rpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
-	switch c.fmt {
-	case BasicRPC:
-		return c.write(r, body)
-	case CustomRPC:
-		return c.writeCustomBody(0, r.Seq, r.ServiceMethod, body)
-	}
-	return fmt.Errorf(unknownRPCFmtErr, c.fmt)
-}
-
-func (c *rpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
-	switch c.fmt {
-	case BasicRPC:
-		return c.write(r, body)
-	case CustomRPC:
-		return c.writeCustomBody(1, r.Seq, r.Error, body)
-	}
-	return fmt.Errorf(unknownRPCFmtErr, c.fmt)
+	
 }
 
 func (c *rpcCodec) ReadResponseBody(body interface{}) error {
 	return c.dec.Decode(body)
 }
 
-func (c *rpcCodec) ReadRequestBody(body interface{}) error {
+// /////////////// Basic RPC Codec ///////////////////
+func (c *basicRpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
+	return c.write(r, body)
+}
+
+func (c *basicRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
+	return c.write(r, body)
+}
+
+func (c *basicRpcCodec) ReadRequestBody(body interface{}) error {
 	return c.dec.Decode(body)
 }
 
-func (c *rpcCodec) ReadResponseHeader(r *rpc.Response) error {
-	switch c.fmt {
-	case BasicRPC:
-		return c.dec.Decode(r)
-	case CustomRPC:
-		return c.parseCustomHeader(1, &r.Seq, &r.Error)
-	}
-	return fmt.Errorf(unknownRPCFmtErr, c.fmt)
+func (c *basicRpcCodec) ReadResponseHeader(r *rpc.Response) error {
+	return c.maybeEOF(c.dec.Decode(r))
 }
 
-func (c *rpcCodec) ReadRequestHeader(r *rpc.Request) error {
-	switch c.fmt {
-	case BasicRPC:
-		return c.dec.Decode(r)
-	case CustomRPC:
-		return c.parseCustomHeader(0, &r.Seq, &r.ServiceMethod)
-	}
-	return fmt.Errorf(unknownRPCFmtErr, c.fmt)
+func (c *basicRpcCodec) ReadRequestHeader(r *rpc.Request) error {
+	return c.maybeEOF(c.dec.Decode(r))
 }
 
-func (c *rpcCodec) parseCustomHeader(expectTypeByte byte, msgid *uint64, methodOrError *string) (err error) {
+// /////////////// Custom RPC Codec ///////////////////
+func (c *customRpcCodec) WriteRequest(r *rpc.Request, body interface{}) error {
+	return c.writeCustomBody(0, r.Seq, r.ServiceMethod, []interface{}{body})
+}
+
+func (c *customRpcCodec) WriteResponse(r *rpc.Response, body interface{}) error {
+	return c.writeCustomBody(1, r.Seq, r.Error, body)
+}
+
+func (c *customRpcCodec) ReadRequestBody(body interface{}) error {
+	bodyArr := []interface{}{body}
+	return c.dec.Decode(&bodyArr)
+}
+
+func (c *customRpcCodec) ReadResponseHeader(r *rpc.Response) error {
+	return c.maybeEOF(c.parseCustomHeader(1, &r.Seq, &r.Error))
+}
+
+func (c *customRpcCodec) ReadRequestHeader(r *rpc.Request) error {
+	return c.maybeEOF(c.parseCustomHeader(0, &r.Seq, &r.ServiceMethod))
+}
+
+func (c *customRpcCodec) parseCustomHeader(expectTypeByte byte, msgid *uint64, methodOrError *string) (err error) {
 
 	// We read the response header by hand 
 	// so that the body can be decoded on its own from the stream at a later time.
@@ -177,31 +229,18 @@ func (c *rpcCodec) parseCustomHeader(expectTypeByte byte, msgid *uint64, methodO
 	return
 }
 
-func (c *rpcCodec) writeCustomBody(typeByte byte, msgid uint64, methodOrError string, body interface{}) (
-	err error) {
-	//if response and error is defined, then ensure body is nil
-	if typeByte == 1 && methodOrError != "" && body != nil {
-		body = nil
-	} 
-	r2 := []interface{}{ typeByte, uint32(msgid), methodOrError, body }
+func (c *customRpcCodec) writeCustomBody(typeByte byte, msgid uint64, methodOrError string, body interface{}) (err error) {
+	var moe interface{} = methodOrError
+	// response needs nil error (not ""), and only one of error or body can be nil
+	if typeByte == 1 {
+		if methodOrError == "" {
+			moe = nil
+		}
+		if moe != nil && body != nil {
+			body = nil
+		}
+	}
+	r2 := []interface{}{ typeByte, uint32(msgid), moe, body }
 	return c.enc.Encode(r2)
-}
-
-func (c *rpcCodec) write(objs ...interface{}) (err error) {
-	for _, obj := range objs {
-		if err = c.enc.Encode(obj); err != nil {
-			return
-		}
-	}
-	return
-}
-
-func (c *rpcCodec) read(objs ...interface{}) (err error) {
-	for _, obj := range objs {
-		if err = c.dec.Decode(obj); err != nil {
-			return
-		}
-	}
-	return
 }
 
