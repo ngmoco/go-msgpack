@@ -46,62 +46,44 @@ import (
 	"bytes"
 	"reflect"
 	"math"
-	"fmt"
 	"time"
 	"encoding/binary"
 )
 
-const (
-	SEC  TimeResolution = iota // seconds
-	MSEC                       // milliseconds (seconds / 1 000)
-	USEC                       // microseconds (seconds / 1 000 000)
-	NSEC                       // nanoseconds  (seconds / 1 000 000 000)
-)
-
-// Some tagging information for error messages.
 var (
+	// Some tagging information for error messages.
 	msgTagEnc = "msgpack.encoder"
-)
-
-// TimeResolution describes the resolution with which to encode/decode time.
-type TimeResolution int
+) 
 
 // An Encoder writes an object to an output stream in the msgpack format.
 type Encoder struct {
 	w io.Writer
-	opt EncoderOptions
-	t []byte        //temp byte array re-used internally for efficiency
-}
-
-type EncoderOptions struct {
-	// when encoding a time to Unix, what resolution do we use.
-	TimeResolution TimeResolution
+	x [16]byte        //temp byte array re-used internally for efficiency
+	t1, t2, t3, t31, t5, t51, t9, t91 []byte // use these, so no need to constantly re-slice
 }
 
 // NewDecoder returns an Encoder for encoding an object.
-// If nil options are passed, we use a Encoder with options:
-//    option: TimeResolution:          USEC
-func NewEncoder(w io.Writer, opts *EncoderOptions) (*Encoder) {	
-	if opts == nil {
-		opts = &EncoderOptions{USEC}
-	} 
-	return &Encoder{w, *opts, make([]byte, 0, 16)}
+func NewEncoder(w io.Writer) (e *Encoder) {	
+	e = &Encoder{w:w}
+	e.t1, e.t2, e.t3, e.t31, e.t5, e.t51, e.t9, e.t91 = 
+		e.x[:1], e.x[:2], e.x[:3], e.x[1:3], e.x[:5], e.x[1:5], e.x[:9], e.x[1:9]
+	return
 }
 
 // Encode writes an object into a stream in the MsgPack format.
 // 
-// time.Time is handled transparently.  We will encode to and from a int64 Unix time 
-// (ie number of nanoseconds since Jan 1, 1970 Epoch) based on the resolution in the 
-// EncoderOptions.
+// time.Time is handled transparently, by (en)decoding (to)from a 
+// []int64{Seconds since Epoch, Nanoseconds offset}.
 // 
-// Struct values encode as maps. Each exported struct field is encoded
-// unless:
-//    - the field is Anonymous (embeded) (Symetry with Json,Gob)
+// Struct values encode as maps. Each exported struct field is encoded unless:
 //    - the field's tag is "-", or
 //    - the field is empty and its tag specifies the "omitempty" option.
 //
 // The empty values are false, 0, any nil pointer or interface value, 
 // and any array, slice, map, or string of length zero. 
+// 
+// Anonymous fields are encoded inline if no msgpack tag is present.
+// Else they are encoded as regular fields.
 // 
 // The object's default key string is the struct field name but can be 
 // specified in the struct field's tag value. 
@@ -138,30 +120,64 @@ func (e *Encoder) encode(v interface{}) {
 }
 
 func (e *Encoder) encodeValue(rv reflect.Value) {
-	if !rv.IsValid() {
-		e.encNil()
-		return
-	}
+	//log("++ enter encode rv: %v, %v", rv, rv.Interface())
+	//defer func() {
+	//	log("++  exit encode rv: %v, %v", rv, rv.Interface())
+	//}()
 	
 	// Tested with a type assertion for all common types first, but this increased encoding time
 	// sometimes by up to 20% (weird). So just use the reflect.Kind switch alone.
 	
+	// ensure more common cases appear early in switch.
 	switch rk := rv.Kind(); rk {
-	case reflect.Slice, reflect.Array:
+	case reflect.Bool:
+		e.encBool(rv.Bool())
+	case reflect.String:
+		e.encString(rv.String())
+	case reflect.Int, reflect.Int8, reflect.Int64, reflect.Int32, reflect.Int16:
+		e.encInt(rv.Int())
+	case reflect.Uint8, reflect.Uint64, reflect.Uint, reflect.Uint32, reflect.Uint16:
+		e.encUint(rv.Uint())
+	case reflect.Float64:
+		e.t9[0] = 0xcb
+		binary.BigEndian.PutUint64(e.t91, math.Float64bits(rv.Float()))
+		e.writeb(9, e.t9)
+	case reflect.Float32:
+		e.t5[0] = 0xca
+		binary.BigEndian.PutUint32(e.t51, math.Float32bits(float32(rv.Float())))
+		e.writeb(5, e.t5)
+	case reflect.Slice:
 		if rv.IsNil() {
 			e.encNil()
 			break
-		}
-		rawbytes := false
-		if rv.Type() == byteSliceTyp {
-			rawbytes = true
-		}
-		l := rv.Len()
-		e.writeContainerLen(rawbytes, true, l)
-		if rawbytes {
-			e.writeb(l, rv.Bytes())
-			break
 		} 
+		l := rv.Len()
+		if rv.Type() == byteSliceTyp {
+			e.writeContainerLen(ContainerRawBytes, l)
+			if l > 0 {
+				e.writeb(l, rv.Bytes())
+			}
+			break
+		}
+		e.writeContainerLen(ContainerList, l)
+		for j := 0; j < l; j++ {
+			e.encode(rv.Index(j))
+		}
+	case reflect.Array:
+		l := rv.Len()
+		// this should not happen (a 0-elem array makes no sense) ... but just in case
+		if l == 0 {
+			e.writeContainerLen(ContainerList, l)
+			break
+		}
+		// log("---- %v", rv.Type())
+		// if rv.Type().Elem().Kind == reflect.Uint8 { // surprisingly expensive (check 1st value instead)
+		if rv.Index(0).Kind() == reflect.Uint8 {
+			e.writeContainerLen(ContainerRawBytes, l)
+			e.writeb(l, rv.Slice(0, l).Bytes())
+			break
+		}
+		e.writeContainerLen(ContainerList, l)
 		for j := 0; j < l; j++ {
 			e.encode(rv.Index(j))
 		}
@@ -170,7 +186,7 @@ func (e *Encoder) encodeValue(rv reflect.Value) {
 			e.encNil()
 			break
 		}
-		e.writeContainerLen(false, false, rv.Len())
+		e.writeContainerLen(ContainerMap, rv.Len())
 		for _, mk := range rv.MapKeys() {
 			e.encode(mk)
 			e.encode(rv.MapIndex(mk))
@@ -179,200 +195,173 @@ func (e *Encoder) encodeValue(rv reflect.Value) {
 		rt := rv.Type()
 		//treat time.Time specially
 		if rt == timeTyp {
-			tnano := rv.Interface().(time.Time).UnixNano()
-			e.encTime(tnano)
+			tt := rv.Interface().(time.Time)
+			e.encode([2]int64{tt.Unix(), int64(tt.Nanosecond())})
 			break
 		}
-		sis := getStructFieldInfos(rt)
-		encNames := make([]string, len(sis.sis))
-		rvals := make([]reflect.Value, len(sis.sis))
-		newlen := 0
-		for _, si := range sis.sis {
-			rval0 := rv.Field(si.i)
-			if si.omitEmpty && isEmptyValue(rval0) {
-				continue
-			}
-			encNames[newlen] = si.encName
-			rvals[newlen] = rval0
-			newlen++
-		}
-		
-		e.writeContainerLen(false, false, newlen)
-		for j := 0; j < newlen; j++ {
-			e.encode([]byte(encNames[j]))
-			e.encode(rvals[j])
-		}
-	case reflect.Bool:
-		e.encBool(rv.Bool())
-	case reflect.Float32:
-		e.encFloat(true, uint64(math.Float32bits(float32(rv.Float()))))
-	case reflect.Float64:
-		e.encFloat(false, math.Float64bits(rv.Float()))
-	case reflect.String:
-		e.encode([]byte(rv.String()))
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		e.encInt(rv.Int())
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		e.encUint(rv.Uint())
+		e.encodeStruct(rt, rv)
 	case reflect.Ptr, reflect.Interface:
 		if rv.IsNil() {
 			e.encNil()
 			break
 		}
 		e.encodeValue(rv.Elem())
+	case reflect.Invalid:
+		e.encNil()
 	default:
-		panic(fmt.Errorf("%s: Unsupported kind: %s, for: %#v", msgTagEnc, rk, rv))
+		e.err("Unsupported kind: %s, for: %#v", rk, rv)
 	}
 	return
 }
 
-func (e *Encoder) writeContainerLen(rawbytes bool, slicelike bool, l int) {
-	var b0, b1, b2 byte = 0x80, 0xde, 0xdf 
-	var l0cutoff int = 16
-	if rawbytes {
-		l0cutoff = 32
-		b0, b1, b2 = 0xa0, 0xda, 0xdb
-	} else if slicelike { 
-		b0, b1, b2 = 0x90, 0xdc, 0xdd
-	}
+func (e *Encoder) writeContainerLen(ct ContainerType, l int) {
+	locutoff, b0, b1, b2 := getContainerByteDesc(ct)
+
 	switch {
-	case l < l0cutoff:
-		e.t = e.t[0:1]
-		e.t[0] = (b0 | byte(l))
+	case l < locutoff:
+		e.t1[0] = (b0 | byte(l))
+		e.writeb(1, e.t1)
 	case l < 65536:
-		e.t = e.t[0:3]
-		e.t[0] = b1
-		binary.BigEndian.PutUint16(e.t[1:], uint16(l))
+		e.t3[0] = b1
+		binary.BigEndian.PutUint16(e.t31, uint16(l))
+		e.writeb(3, e.t3)
 	default:
-		e.t = e.t[0:5]
-		e.t[0] = b2
-		binary.BigEndian.PutUint32(e.t[1:], uint32(l))
+		e.t5[0] = b2
+		binary.BigEndian.PutUint32(e.t51, uint32(l))
+		e.writeb(5, e.t5)
 	}
-	e.write()
 }
 
 func (e *Encoder) encNil() {
-	e.t = e.t[0:1]
-	e.t[0] = 0xc0
-	e.write()
-}
-
-func (e *Encoder) encBool(b bool) {	
-	e.t = e.t[0:1]
-	if b {
-		e.t[0] = 0xc3
-	} else {
-		e.t[0] = 0xc2
-	}
-	e.write()
+	e.t1[0] = 0xc0
+	e.writeb(1, e.t1)
 }
 
 func (e *Encoder) encInt(i int64) {
 	switch {
 	case i < math.MinInt32 || i > math.MaxInt32:
-		e.t = e.t[0:9]
-		e.t[0] = 0xd3
-		binary.BigEndian.PutUint64(e.t[1:], uint64(i))
+		e.t9[0] = 0xd3
+		binary.BigEndian.PutUint64(e.t91, uint64(i))
+		e.writeb(9, e.t9)
 	case i < math.MinInt16 || i > math.MaxInt16:
-		e.t = e.t[0:5]
-		e.t[0] = 0xd2
-		binary.BigEndian.PutUint32(e.t[1:], uint32(i))
+		e.t5[0] = 0xd2
+		binary.BigEndian.PutUint32(e.t51, uint32(i))
+		e.writeb(5, e.t5)
 	case i < math.MinInt8 || i > math.MaxInt8:
-		e.t = e.t[0:3]
-		e.t[0] = 0xd1
-		binary.BigEndian.PutUint16(e.t[1:], uint16(i))
+		e.t3[0] = 0xd1
+		binary.BigEndian.PutUint16(e.t31, uint16(i))
+		e.writeb(3, e.t3)
 	case i < -32:
-		e.t = e.t[0:2]
-		e.t[0], e.t[1] = 0xd0, byte(i)
+		e.t2[0], e.t2[1] = 0xd0, byte(i)
+		e.writeb(2, e.t2)
 	case i >= -32 && i <= math.MaxInt8:
-		e.t = e.t[0:1]
-		e.t[0] = byte(i)
+		e.t1[0] = byte(i)
+		e.writeb(1, e.t1)
 	default:
-		panic("encInt64: Unreachable block")
+		e.err("encInt64: Unreachable block")
 	}
-	e.write()
 }
 
 func (e *Encoder) encUint(i uint64) {
-	e.encUintFl(false, false, i)
-}
-
-func (e *Encoder) encFloat(f32 bool, i uint64) {
-	e.encUintFl(f32, !f32, i)
-}
-
-func (e *Encoder) encUintFl(f32 bool, f64 bool, i uint64) {
 	switch {
-	case f32:
-		e.t = e.t[0:5]
-		e.t[0] = 0xca
-		binary.BigEndian.PutUint32(e.t[1:], uint32(i))
-	case f64:
-		e.t = e.t[0:9]
-		e.t[0] = 0xcb
-		binary.BigEndian.PutUint64(e.t[1:], i)
 	case i <= math.MaxInt8:
-		e.t = e.t[0:1]
-		e.t[0] = byte(i)
+		e.t1[0] = byte(i)
+		e.writeb(1, e.t1)
 	case i <= math.MaxUint8:
-		e.t = e.t[0:2]
-		e.t[0], e.t[1] = 0xcc, byte(i)
+		e.t2[0], e.t2[1] = 0xcc, byte(i)
+		e.writeb(2, e.t2)
 	case i <= math.MaxUint16:
-		e.t = e.t[0:3]
-		e.t[0] = 0xcd
-		binary.BigEndian.PutUint16(e.t[1:], uint16(i))
+		e.t3[0] = 0xcd
+		binary.BigEndian.PutUint16(e.t31, uint16(i))
+		e.writeb(3, e.t3)
 	case i <= math.MaxUint32:
-		e.t = e.t[0:5]
-		e.t[0] = 0xce
-		binary.BigEndian.PutUint32(e.t[1:], uint32(i))
+		e.t5[0] = 0xce
+		binary.BigEndian.PutUint32(e.t51, uint32(i))
+		e.writeb(5, e.t5)
 	default:
-		e.t = e.t[0:9]
-		e.t[0] = 0xcf
-		binary.BigEndian.PutUint64(e.t[1:], i)
+		e.t9[0] = 0xcf
+		binary.BigEndian.PutUint64(e.t91, i)
+		e.writeb(9, e.t9)
 	}
-	e.write()
-	return
 }
 
-func (e *Encoder) encTime(tnano int64) {
-	//e.encode(tnano / 1e3); return
-	//TODO: Perf: This switch statement increases encode time by 30% (169us to 242us)
-	//when in calling function. Moving to its own functions to fix.
-	switch e.opt.TimeResolution {
-	case SEC:  
-		tnano = tnano / 1e9
-	case MSEC: 
-		tnano = tnano / 1e6
-	case USEC: 
-		tnano = tnano / 1e3
-	case NSEC: 
-	default: 
-		panic(fmt.Errorf("%s: Invalid Time Resolution: %d", msgTagEnc, e.opt.TimeResolution))
+func (e *Encoder) encBool(b bool) {
+	if b {
+		e.t1[0] = 0xc3
+	} else {
+		e.t1[0] = 0xc2
 	}
-	e.encode(tnano)
+	e.writeb(1, e.t1)
 }
 
-func (e *Encoder) write() {
-	e.writeb(len(e.t), e.t)
+func (e *Encoder) encodeStruct(rt reflect.Type, rv reflect.Value) {
+	sis := getStructFieldInfos(rt)
+	// e.writeContainerLen(ContainerMap, len(sis.sis))
+	// for _, si := range sis.sis {
+	// 	e.encode(si.encNameBs)
+	// 	e.encode(si.field(rv))
+	// }
+	// return
+	
+	encNames := make([][]byte, len(sis.sis))
+	rvals := make([]reflect.Value, len(sis.sis))
+	newlen := 0
+	for _, si := range sis.sis {
+		rval0 := si.field(rv)
+		if si.omitEmpty && isEmptyValue(rval0) {
+			continue
+		}
+		encNames[newlen] = si.encNameBs
+		rvals[newlen] = rval0
+		newlen++
+	}
+	
+	e.writeContainerLen(ContainerMap, newlen)
+	for j := 0; j < newlen; j++ {
+		e.encode(encNames[j])
+		e.encode(rvals[j])
+	}
+	
 }
 
-func (e *Encoder) writeb(numbytes int, bs []byte) []byte {
-	n, err := e.w.Write(bs)
+func (e *Encoder) encString(s string) {
+	numbytes := len(s)
+	e.writeContainerLen(ContainerRawBytes, numbytes)
+	// e.encode([]byte(s)) // using io.WriteString is faster
+	n, err := io.WriteString(e.w, s)
 	if err != nil {
-		panic(err)
+		e.err("Error: %v", err)
 	}
 	if n != numbytes {
-		panic(fmt.Errorf("%s: write: Incorrect num bytes read. Expecting: %v, Wrote: %v", 
-			msgTagEnc, numbytes, n))
+		e.err("write: Incorrect num bytes written. Expecting: %v, Wrote: %v", numbytes, n)
 	}
-	return bs	
+}
+
+func (e *Encoder) writeb(numbytes int, bs []byte) {
+	// no sanity checking. Assume callers pass valid arguments. It's pkg-private: we can control it.
+	n, err := e.w.Write(bs)
+	if err != nil {
+		// propagage io.EOF upwards (it's special, and must be returned AS IS)
+		if err == io.EOF {
+			panic(err)
+		} else {
+			e.err("Error: %v", err)
+		}
+	}
+	if n != numbytes {
+		e.err("write: Incorrect num bytes written. Expecting: %v, Wrote: %v", numbytes, n)
+	}
+}
+
+func (e *Encoder) err(format string, params ...interface{}) {
+	doPanic(msgTagEnc, format, params)
 }
 
 // Marshal is a convenience function which encodes v to a stream of bytes. 
 // It delegates to Encoder.Encode.
-func Marshal(v interface{}, opts *EncoderOptions) (b []byte, err error) {
+func Marshal(v interface{}) (b []byte, err error) {
 	bs := new(bytes.Buffer)
-	if err = NewEncoder(bs, opts).Encode(v); err == nil {
+	if err = NewEncoder(bs).Encode(v); err == nil {
 		b = bs.Bytes()
 	}
 	return
