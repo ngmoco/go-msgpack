@@ -33,7 +33,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /*
 MsgPack library for Go.
 
-http://wiki.msgpack.org/display/MSGPACK/Format+specification
+Implements:
+  http://wiki.msgpack.org/display/MSGPACK/Format+specification
 
 It provides features similar to encoding packages in the standard library (ie json, xml, gob, etc).
 
@@ -42,34 +43,34 @@ Supports:
   - Standard field renaming via tags
   - Encoding from any value (struct, slice, map, primitives, pointers, interface{}, etc)
   - Decoding into pointer to any non-nil value (struct, slice, map, int, float32, bool, string, etc)
-  - Decoding into a nil interface{} (big)
-  - Handles time.Time transparently (as int64 UnixNano to specified resolution)
+  - Decoding into a nil interface{} 
+  - Handles time.Time transparently 
+  - Provides a Server and Client Codec so msgpack can be used as communication protocol for net/rpc.
+    Also includes an option for msgpack-rpc: http://wiki.msgpack.org/display/MSGPACK/RPC+specification
 
 Usage
 
   dec = msgpack.NewDecoder(r, nil)
   err = dec.Decode(&v) 
   
-  enc = msgpack.NewEncoder(w, nil)
+  enc = msgpack.NewEncoder(w)
   err = enc.Encode(v) 
   
   //methods below are convenience methods over functions above.
-  data, err = msgpack.Marshal(v, nil) 
+  data, err = msgpack.Marshal(v) 
   err = msgpack.Unmarshal(data, &v, nil)
+  
+  //RPC Server
+  conn, err := listener.Accept()
+  rpcCodec := msgpack.NewRPCServerCodec(conn, nil)
+  rpc.ServeCodec(rpcCodec)
 
-JSON Compatibility
-
-The Decoder takes options that can allow you specify that 
-your resulting map should be JSON compatible. For example,
-you can specify that all []byte be converted to strings and
-all maps be of type map[string]interface{}.
-
-See NewDecoder(...) documentation.
-
+  //RPC Communication (client side)
+  conn, err = net.Dial("tcp", "localhost:5555")  
+  rpcCodec := msgpack.NewRPCClientCodec(conn, nil)  
+  client := rpc.NewClientWithCodec(rpcCodec)  
+ 
 */
 package msgpack
 
-
-// BUG(ugorji): This package ignores anonymous (embedded) struct fields during encoding and decoding. 
-// This is in line with the behaviour of Json and Xml packages as of Go 1. 
 
