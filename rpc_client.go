@@ -31,7 +31,7 @@ package msgpack
 import (
 	"net"
 	"sync/atomic"
-	"log"
+	golog "log"
 	"errors"
 	"reflect"
 	"time"
@@ -49,6 +49,7 @@ const DefaultFlightLimitSize = 100
  */
 type Client struct {
 	conn net.Conn
+	localAddr string
 	dec *Decoder
 	enc *Encoder
 	msgid uint32
@@ -67,7 +68,7 @@ type Client struct {
 
 type ClientResponse struct {
 	Msgid uint32
-	Error error
+	Error interface{}
 	Result interface{}
 }
 
@@ -76,19 +77,20 @@ type replyCheck struct {
 	replyChan chan ClientResponse
 }
 
-func NewClient(conn net.Conn, dopts *DecoderOptions, eopts *EncoderOptions) (*Client) {
-	return NewClientWithOptions(conn, nil, nil)
+func NewClient(conn net.Conn) (*Client) {
+	return NewClientWithOptions(conn, nil)
 }
 
-func NewClientWithOptions(conn net.Conn, dopts *DecoderOptions, eopts *EncoderOptions) (*Client) {
-	return NewClientWithOptionsAndFlightLimit(conn, dopts, eopts, DefaultFlightLimitSize)
+func NewClientWithOptions(conn net.Conn, dopts DecoderContainerResolver) (*Client) {
+	return NewClientWithOptionsAndFlightLimit(conn, dopts, DefaultFlightLimitSize)
 }
 
-func NewClientWithOptionsAndFlightLimit(conn net.Conn, dopts *DecoderOptions, eopts *EncoderOptions, inFlight int) (*Client) {
+func NewClientWithOptionsAndFlightLimit(conn net.Conn, dopts DecoderContainerResolver, inFlight int) (*Client) {
 	c := &Client{
 		conn: conn,
+		localAddr: conn.LocalAddr().String(),
 		dec: NewDecoder(conn, dopts),
-		enc: NewEncoder(conn, eopts),
+		enc: NewEncoder(conn),
 		msgid: 1,
 		sendChan: make(chan []interface{}), // the network buffer is going to buffer a bunch of requests so use the inflight limit
 		// unbuffered to make sure we have it on the reply side before we send the message
@@ -105,7 +107,7 @@ func NewClientWithOptionsAndFlightLimit(conn net.Conn, dopts *DecoderOptions, eo
 // Send a request and wait for a response
 // @return the result data or error if there is an error
 //    if the error is of type ClientClosedError, then the client has ahd a fatal error and can no longer be used.
-func (c *Client) Send(method string, params []interface{}) (interface{}, error) {
+func (c *Client) Send(method string, params []interface{}) (interface{}, interface{}) {
 	replyChan := make(chan ClientResponse)
 	// ignore msgid since i'm creating a new chan every time
 	_, err := c.SendAsync(method, params, replyChan)
@@ -177,23 +179,18 @@ func (c *Client) sender() {
 		// receive when the wait hits the threshold
 		c.flightLimit <- 1
 	}
-	log.Println("RPC client socket writer shutting down")
+	golog.Println(c.localAddr, "RPC client socket writer shutting down")
 }
 
 func (c *Client) receiver() {
 	// holds a map of message ID's to their response channels
 	replyMap := make(map[uint32]chan ClientResponse)
-	first := true
+	go c.connRecv()
 	for c.closed != 1 || c.graceful == 1 {
 		select {
 		case replyCheck := <- c.replyCheckChan:
 			// TODO: check map for lost messages (timed-out) and return errors
 			replyMap[replyCheck.msgid] = replyCheck.replyChan
-			// when I get the first reqest, start the socket receiver go routine
-			if first {
-				first = false
-				go c.connRecv()
-			}
 		case reply := <- c.replyChanInternal:
 			replyChan := replyMap[reply.Msgid]
 			delete(replyMap, reply.Msgid)
@@ -202,13 +199,13 @@ func (c *Client) receiver() {
 				select {
 				case replyChan <- reply:
 				default:
-					log.Printf("Discarded message %v on busy channel", reply.Msgid)
+					golog.Printf("Discarded message %v on busy channel", reply.Msgid)
 				}
 			}
 			// decrement in in flight... this should never block since it will be increment in the sender before it gets here
 			<- c.flightLimit
 		case err := <- c.dieChan:
-			log.Println("RPC Client shutting down:", err)
+			golog.Println(c.localAddr, "RPC Client shutting down:", err)
 			// shutdown everything and clear the rest of the responses with an error
 			// this stops the senders
 			c.cce = &ClientClosedError{err}
@@ -242,7 +239,7 @@ func (c *Client) receiver() {
 		default:
 		}
 	}
-	log.Println("RPC Client closed to requests")
+	golog.Println(c.localAddr, "RPC Client closed to requests")
 }
 
 func (c *Client) ShutdownGracefully(timeout time.Duration, done chan int) {
@@ -287,7 +284,7 @@ func (c *Client) cleanup(replyMap map[uint32]chan ClientResponse) {
 				select {
 				case replyChan <- reply:
 				default:
-					log.Printf("Discarded message %v on busy channel", reply.Msgid)
+					golog.Printf("Discarded message %v on busy channel", reply.Msgid)
 				}
 			}
 		default:
@@ -315,7 +312,7 @@ func (c *Client) cleanup(replyMap map[uint32]chan ClientResponse) {
 		select {
 		case replyChan <- ClientResponse{msgid, c.cce, nil}:
 		default:
-			log.Printf("Discarded message %v on busy channel", msgid)
+			golog.Printf("Discarded message %v on busy channel", msgid)
 		}
 	}
 	
@@ -347,27 +344,28 @@ func (c *Client) connRecv() {
 				msgid = uint32(val.Uint())
 			default:
 				// error out here as well since we can't figure out where to send the response
-				log.Printf("Can't parse msgId from %v, skipping reply\n", msgpack_reply[1])
+				golog.Printf("Can't parse msgId from %v, skipping reply\n", msgpack_reply[1])
 				continue
 			}			
 			
+			var errReply interface{}
 			// The error, if not nil, expect a string
 			if msgpack_reply[2] != nil {
 				if errStr, ok := msgpack_reply[2].(string); ok {
-					err = errors.New(errStr)
+					errReply = errors.New(errStr)
 				} else {
-					log.Printf("Error not nil, but not string: %v\n", msgpack_reply[2])
+					errReply = msgpack_reply[2]
 				}
 			} else {
-				err = nil
+				errReply = nil
 			}
 			// Send the reply to the receiver for routing back to the sender
-			c.replyChanInternal <- ClientResponse{msgid, err, msgpack_reply[3]}
+			c.replyChanInternal <- ClientResponse{msgid, errReply, msgpack_reply[3]}
 		} else {
-			log.Printf("Bad reply from server: %v\n", v)
+			golog.Printf("Bad reply from server: %v\n", v)
 		}
 	}
-	log.Println("RPC socket reader shutting down")
+	golog.Println(c.localAddr, "RPC socket reader shutting down")
 }
 
 type ClientClosedError struct {
