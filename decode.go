@@ -383,44 +383,8 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool, rv0 refl
 		case 0xcb:
 			rv.SetFloat(math.Float64frombits(d.readUint64()))
 			
-		case 0xcc:
-			rv.SetUint(uint64(d.readUint8()))
-		case 0xcd:
-			rv.SetUint(uint64(d.readUint16()))
-		case 0xce:
-			rv.SetUint(uint64(d.readUint32()))
-		case 0xcf:
-			rv.SetUint(d.readUint64())
-			
-		case 0xd0:
-			rv.SetInt(int64(int8(d.readUint8())))
-		case 0xd1:
-			rv.SetInt(int64(int16(d.readUint16())))
-		case 0xd2:
-			rv.SetInt(int64(int32(d.readUint32())))
-		case 0xd3:
-			rv.SetInt(int64(d.readUint64()))
-
 		default:
-			//may be a single-byte integer
-			defHandled := false
-			switch rk {
-			case reflect.Int, reflect.Int64, reflect.Int32, reflect.Int8, reflect.Int16:
-				// if sbd > -32 && sbd <= math.MaxInt8 {
-				if bd >= 0x00 && bd <= 0x7f || bd >= 0xe0 && bd <= 0xff {
-					rv.SetInt(int64(int8(bd)))
-					defHandled = true
-				}
-			case reflect.Uint8, reflect.Uint64, reflect.Uint, reflect.Uint32, reflect.Uint16:
-				// if bd <= math.MaxInt8 {
-				if bd >= 0x00 && bd <= 0x7f {
-					rv.SetUint(uint64(bd))
-					defHandled = true
-				}
-			}
-			if !defHandled {
-				d.err("Unhandled single-byte value: %s: %x", msgBadDesc, bd)
-			}
+			d.err("Unhandled single-byte value: %s: %x", msgBadDesc, bd)
 		}
 	case reflect.String:
 		if containerLen < 0 {
@@ -585,6 +549,20 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool, rv0 refl
 		d.decodeValue(bd, containerLen, false, rv.Elem())
 	case reflect.Interface:
 		d.decodeValue(bd, containerLen, false, rv.Elem())
+	case reflect.Int, reflect.Int64, reflect.Int32, reflect.Int8, reflect.Int16:
+		i, _ := d.decodeInteger(bd, true)
+		if rv.OverflowInt(i) {
+			d.err("Overflow int value: %v into kind: %v", i, rk)
+		} else {
+			rv.SetInt(i)
+		}
+	case reflect.Uint8, reflect.Uint64, reflect.Uint, reflect.Uint32, reflect.Uint16:
+		_, ui := d.decodeInteger(bd, false)
+		if rv.OverflowUint(ui) {
+			d.err("Overflow unsigned int value: %v into kind: %v", ui, rk)
+		} else {
+			rv.SetUint(ui)
+		}
 	}
 	return
 }
@@ -609,6 +587,84 @@ func (d *Decoder) decodeValuePostList(rv reflect.Value, containerLen int, elemIs
 	}
 }
 	
+// decode an integer from the stream
+func (d *Decoder) decodeInteger(bd byte, sign bool) (i int64, ui uint64) {
+	switch {
+	case bd == 0xcc:
+		ui = uint64(d.readUint8())
+		if sign {
+			i = int64(ui)
+		}
+	case bd == 0xcd:
+		ui = uint64(d.readUint16())
+		if sign {
+			i = int64(ui)
+		}
+	case bd == 0xce:
+		ui = uint64(d.readUint32())
+		if sign {
+			i = int64(ui)
+		}
+	case bd == 0xcf:
+		ui = d.readUint64()
+		if sign {
+			i = int64(ui)
+		}
+
+	case bd == 0xd0:
+		i = int64(int8(d.readUint8()))
+		if !sign {
+			if i >= 0 {
+				ui = uint64(i)
+			} else {
+				d.err("Assigning negative signed value: %v, to unsigned type", i)
+			}
+		}
+	case bd == 0xd1:
+		i = int64(int16(d.readUint16()))
+		if !sign {
+			if i >= 0 {
+				ui = uint64(i)
+			} else {
+				d.err("Assigning negative signed value: %v, to unsigned type", i)
+			}
+		}
+	case bd == 0xd2:
+		i = int64(int32(d.readUint32()))
+		if !sign {
+			if i >= 0 {
+				ui = uint64(i)
+			} else {
+				d.err("Assigning negative signed value: %v, to unsigned type", i)
+			}
+		}
+	case bd == 0xd3:
+		i = int64(d.readUint64())
+		if !sign {
+			if i >= 0 {
+				ui = uint64(i)
+			} else {
+				d.err("Assigning negative signed value: %v, to unsigned type", i)
+			}
+		}
+
+	case bd >= 0x00 && bd <= 0x7f:
+		if sign {
+			i = int64(int8(bd))
+		} else {
+			ui = uint64(bd)
+		}
+	case bd >= 0xe0 && bd <= 0xff:
+		i = int64(int8(bd))
+		if !sign {
+			d.err("Assigning negative signed value: %v, to unsigned type", i)
+		}
+	default:
+		d.err("Unhandled single-byte unsigned integer value: %s: %x", msgBadDesc, bd)
+	}
+	return
+}
+
 // read a number of bytes into bs
 func (d *Decoder) readb(numbytes int, bs []byte) {
 	n, err := io.ReadAtLeast(d.r, bs, numbytes) 
