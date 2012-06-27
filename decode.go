@@ -498,10 +498,12 @@ func (d *Decoder) decodeValue(bd byte, containerLen int, readDesc bool, rv0 refl
 			d.decodeValue(0, -1, true, rvk)
 			rvksi := getStructFieldInfos(rvtype).getForEncName(rvkencname)
 			if rvksi == nil {
-				d.err("DecodeValue: Invalid Enc Field: %s", rvkencname)
+				// d.err("DecodeValue: Invalid Enc Field: %s", rvkencname) (skip it)
+				var nilintf0 interface{}
+				d.decodeValueT(0, -1, true, reflect.ValueOf(&nilintf0), true, true, true)
+			} else {
+				d.decodeValueT(0, -1, true, rvksi.field(rv), true, true, true)
 			}
-
-			d.decodeValueT(0, -1, true, rvksi.field(rv), true, true, true)
 		}
 	case reflect.Map:
 		if containerLen < 0 {

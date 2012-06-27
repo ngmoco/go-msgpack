@@ -444,6 +444,31 @@ func TestIntfDecode(t *testing.T) {
 	}
 }
 
+func TestDecodeStructSubset(t *testing.T) {
+	// test that we can decode a subset of the stream
+	m := map[string]interface{}{"A": 5, "B": 99, "C": 333, }
+	bs, err := Marshal(m)
+	if err != nil {
+		logT(t, "Error marshalling m: %v, Err: %v", m, err)
+		t.FailNow()
+	}
+	type ttt struct {
+		A uint8
+		C int32
+	}
+	var t2 ttt
+	err = Unmarshal(bs, &t2, nil)
+	if err != nil {
+		logT(t, "Error unmarshalling into &t2: %v, Err: %v", t2, err)
+		t.FailNow()
+	}
+	t3 := ttt{5, 333}
+	if !reflect.DeepEqual(t2, t3) {
+		logT(t, "Not Equal: t2: %v, t3: %v", t2, t3)
+		t.FailNow()
+	}
+}
+
 // comment out for now
 func TestRpcAll(t *testing.T) {
 	testRpc(t, true, true, true, true)
