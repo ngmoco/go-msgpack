@@ -395,3 +395,6 @@ type ClientClosedError struct {
 func (cce *ClientClosedError) Error() string {
 	return cce.Cause.Error()
 }
+func (cce *ClientClosedError) String() string {
+	return cce.Cause.Error()
+}
